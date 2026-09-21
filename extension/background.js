@@ -276,19 +276,52 @@ async function handleNavigate(params) {
 }
 
 async function handleClick(params) {
-  const { ref, selector, button = 'left', doubleClick = false } = params;
+  const { ref, selector, x: px, y: py, button = 'left', doubleClick = false } = params;
   const tab = await getActiveTab();
 
-  return execInTab(tab.id, (_ref, _sel, _btn, _dbl) => {
-    let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
-    if (!el && _sel) el = document.querySelector(_sel);
+  return execInTab(tab.id, (_ref, _sel, _px, _py, _btn, _dbl) => {
+    // Refs and selectors miss anything inside a shadow root, so the lookup
+    // descends through open shadow roots before giving up.
+    function deepQuery(sel) {
+      const direct = document.querySelector(sel);
+      if (direct) return direct;
+      const stack = [document];
+      while (stack.length) {
+        const root = stack.pop();
+        for (const el of root.querySelectorAll('*')) {
+          if (el.shadowRoot) {
+            const hit = el.shadowRoot.querySelector(sel);
+            if (hit) return hit;
+            stack.push(el.shadowRoot);
+          }
+        }
+      }
+      return null;
+    }
+
+    let el = _ref ? deepQuery(`[data-mcp-ref="${_ref}"]`) : null;
+    if (!el && _sel) el = deepQuery(_sel);
+
+    // Coordinates are the fallback when nothing can be addressed: whatever is
+    // painted at that point gets the click, the way a person clicking would.
+    if (!el && _px != null && _py != null) {
+      el = document.elementFromPoint(_px, _py);
+      let root = el && el.shadowRoot;
+      while (root) {
+        const inner = root.elementFromPoint(_px, _py);
+        if (!inner || inner === el) break;
+        el = inner;
+        root = el.shadowRoot;
+      }
+    }
     if (!el) return { success: false, error: 'Element not found' };
 
-    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+    const usingPoint = _px != null && _py != null && !_ref && !_sel;
+    if (!usingPoint) el.scrollIntoView({ behavior: 'instant', block: 'center' });
 
     const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
+    const x = usingPoint ? _px : rect.left + rect.width / 2;
+    const y = usingPoint ? _py : rect.top + rect.height / 2;
     const btnVal = _btn === 'left' ? 0 : _btn === 'right' ? 2 : 1;
     const init = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: btnVal };
 
@@ -306,7 +339,7 @@ async function handleClick(params) {
     }
 
     return { success: true };
-  }, [ref, selector, button, doubleClick]);
+  }, [ref, selector, px, py, button, doubleClick]);
 }
 
 async function handleType(params) {
@@ -542,6 +575,24 @@ async function handleSnapshot(params) {
       return first.slice(0, 80);
     }
 
+    // A page's real children include anything behind an open shadow root or a
+    // same-origin frame. Walking element.children alone makes every component
+    // built that way invisible to the snapshot, and so unclickable by ref.
+    function childrenOf(el) {
+      const out = [];
+      if (el.shadowRoot) out.push(...el.shadowRoot.children);
+      if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+        try {
+          const doc = el.contentDocument;
+          if (doc && doc.body) out.push(doc.body);
+        } catch {
+          // cross-origin frame: not readable, and not ours to reach into
+        }
+      }
+      out.push(...el.children);
+      return out;
+    }
+
     function isInteractive(el) {
       const tags = ['A','BUTTON','INPUT','SELECT','TEXTAREA'];
       return tags.includes(el.tagName) || el.onclick || el.getAttribute('tabindex') !== null ||
@@ -563,7 +614,7 @@ async function handleSnapshot(params) {
       const isLandmark = landmarkRoles.has(r);
 
       const kids = [];
-      for (const c of el.children) {
+      for (const c of childrenOf(el)) {
         const cn = buildCompact(c);
         if (cn) Array.isArray(cn) ? kids.push(...cn) : kids.push(cn);
       }
@@ -598,7 +649,7 @@ async function handleSnapshot(params) {
 
       if (r === 'generic' && !n && !ia && depth > 1) {
         const kids = [];
-        for (const c of el.children) {
+        for (const c of childrenOf(el)) {
           const cn = buildFull(c, depth + 1);
           if (cn) Array.isArray(cn) ? kids.push(...cn) : kids.push(cn);
         }

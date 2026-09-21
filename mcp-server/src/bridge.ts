@@ -71,20 +71,41 @@ export class ExtensionBridge {
     }
   }
 
+  private listeningPids(): number[] {
+    // Windows has no lsof, so the port owner is read from netstat there.
+    if (process.platform === 'win32') {
+      // No -p filter: "-p TCP" lists IPv4 only, and the bridge binds localhost,
+      // which resolves to ::1 first. Filtering by protocol hides the real owner.
+      const out = execSync('netstat -ano', { encoding: 'utf8' });
+      const pids = new Set<number>();
+      for (const line of out.split(/\r?\n/)) {
+        const m = line.match(/^\s*TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+        if (m && parseInt(m[2], 10) === this.port) pids.add(parseInt(m[3], 10));
+      }
+      return [...pids];
+    }
+    const output = execSync(`lsof -ti :${this.port} -sTCP:LISTEN`, { encoding: 'utf8' }).trim();
+    return output ? output.split('\n').map(p => parseInt(p, 10)) : [];
+  }
+
   private killStaleProcess(): void {
     try {
-      const output = execSync(`lsof -ti :${this.port} -sTCP:LISTEN`, { encoding: 'utf8' }).trim();
-      if (output) {
-        for (const pid of output.split('\n')) {
-          const p = parseInt(pid, 10);
-          if (p && p !== process.pid) {
-            console.error(`[Bridge] Killing stale PID ${p}`);
-            process.kill(p, 'SIGTERM');
+      for (const p of this.listeningPids()) {
+        if (!p || p === process.pid) continue;
+        console.error(`[Bridge] Killing stale PID ${p}`);
+        // SIGTERM is not delivered on Windows; taskkill is the portable stop.
+        if (process.platform === 'win32') {
+          try {
+            execSync(`taskkill /PID ${p} /F`, { stdio: 'ignore' });
+          } catch {
+            // already gone, or not ours to kill
           }
+        } else {
+          process.kill(p, 'SIGTERM');
         }
       }
     } catch {
-      // lsof returns exit 1 when no match — that's fine
+      // no listener found, which is the normal case
     }
   }
 
