@@ -2,6 +2,7 @@ import type { ToolDefinition } from './types.js';
 import { navigateTool } from './navigate.js';
 import { clickTool } from './click.js';
 import { typeTool } from './type.js';
+import { typeTrustedTool } from './type-trusted.js';
 import { scrollTool } from './scroll.js';
 import { pressKeyTool } from './press-key.js';
 import { waitTool } from './wait.js';
@@ -26,6 +27,7 @@ export const allTools: ToolDefinition[] = [
   navigateTool,
   clickTool,
   typeTool,
+  typeTrustedTool,
   scrollTool,
   pressKeyTool,
   waitTool,

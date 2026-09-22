@@ -23,6 +23,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   browser_screenshot: 10_000,
   browser_click: 10_000,
   browser_type: 15_000,
+  browser_type_trusted: 30_000,
   browser_press_key: 5_000,
   browser_hover: 5_000,
   browser_select: 10_000,

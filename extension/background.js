@@ -208,6 +208,7 @@ async function dispatch(tool, params) {
     browser_navigate: handleNavigate,
     browser_click: handleClick,
     browser_type: handleType,
+    browser_type_trusted: handleTypeTrusted,
     browser_scroll: handleScroll,
     browser_press_key: handlePressKey,
     browser_wait: handleWait,
@@ -376,6 +377,55 @@ async function handleType(params) {
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return { success: true, typed: _text };
   }, [ref, selector, text, clear]);
+}
+
+/**
+ * Type through the debugger, so the page receives trusted input.
+ *
+ * A synthetic KeyboardEvent or execCommand changes the rendered DOM but never
+ * reaches an editor that keeps its own model. Draft.js, ProseMirror, CodeMirror
+ * and Monaco all ignore untrusted events, so the text appears on screen and is
+ * absent from what the page actually saves. Input.insertText is real input.
+ */
+async function handleTypeTrusted(params) {
+  const { ref, selector, text, clear = false } = params;
+  const tab = await getActiveTab();
+
+  const focused = await execInTab(tab.id, (_ref, _sel) => {
+    let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
+    if (!el && _sel) el = document.querySelector(_sel);
+    if (!el) return { success: false, error: 'Element not found' };
+    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+    el.focus();
+    if (el.setSelectionRange && typeof el.value === 'string') {
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+    return { success: true };
+  }, [ref, selector]);
+
+  if (focused && focused.success === false) return focused;
+
+  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  try {
+    if (clear) {
+      // select all, then let the deletion go through the page's own handling
+      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchKeyEvent', {
+        type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2,
+      });
+      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2,
+      });
+      for (const t of ['rawKeyDown', 'keyUp']) {
+        await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchKeyEvent', {
+          type: t, key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46,
+        });
+      }
+    }
+    await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.insertText', { text });
+    return { success: true, typed: text, trusted: true };
+  } finally {
+    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+  }
 }
 
 async function handleScroll(params) {
