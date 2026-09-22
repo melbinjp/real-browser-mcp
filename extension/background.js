@@ -326,9 +326,25 @@ async function handleClick(params) {
     const btnVal = _btn === 'left' ? 0 : _btn === 'right' ? 2 : 1;
     const init = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: btnVal };
 
+    // elementFromPoint often resolves to a non-focusable inner node (e.g. a
+    // <p> inside a contenteditable ancestor). Calling .focus() on that is a
+    // silent no-op, so climb to the nearest element that can actually take
+    // focus before focusing, while still dispatching the mouse events on the
+    // node actually under the cursor.
+    function nearestFocusable(node) {
+      let cur = node;
+      while (cur) {
+        if (cur.isContentEditable) return cur.closest('[contenteditable="true"], [contenteditable=""]') || cur;
+        if (cur.tabIndex >= 0 || /^(input|textarea|select|button|a)$/i.test(cur.tagName || '')) return cur;
+        cur = cur.parentElement;
+      }
+      return node;
+    }
+
     el.dispatchEvent(new MouseEvent('mouseover', init));
     el.dispatchEvent(new MouseEvent('mousedown', init));
-    if (el.focus) el.focus();
+    const focusTarget = nearestFocusable(el);
+    if (focusTarget && focusTarget.focus) focusTarget.focus();
     el.dispatchEvent(new MouseEvent('mouseup', init));
     el.dispatchEvent(new MouseEvent('click', init));
 
@@ -392,8 +408,34 @@ async function handleTypeTrusted(params) {
   const tab = await getActiveTab();
 
   const focused = await execInTab(tab.id, (_ref, _sel) => {
-    let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
-    if (!el && _sel) el = document.querySelector(_sel);
+    // Deep lookup: the real caret is often inside an open shadow root (a web
+    // component's own contenteditable or textarea), which plain
+    // document.querySelector cannot see. Fall back to whatever already has
+    // real focus, wherever it lives, since a prior real click put it there.
+    function deepQuery(sel) {
+      const direct = document.querySelector(sel);
+      if (direct) return direct;
+      const stack = [document];
+      while (stack.length) {
+        const root = stack.pop();
+        for (const el of root.querySelectorAll('*')) {
+          if (el.shadowRoot) {
+            const hit = el.shadowRoot.querySelector(sel);
+            if (hit) return hit;
+            stack.push(el.shadowRoot);
+          }
+        }
+      }
+      return null;
+    }
+    function deepActiveElement() {
+      let el = document.activeElement;
+      while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+      return el;
+    }
+    let el = _ref ? deepQuery(`[data-mcp-ref="${_ref}"]`) : null;
+    if (!el && _sel) el = deepQuery(_sel);
+    if (!el && !_ref && !_sel) el = deepActiveElement();
     if (!el) return { success: false, error: 'Element not found' };
     el.scrollIntoView({ behavior: 'instant', block: 'center' });
     el.focus();
