@@ -1205,6 +1205,7 @@ async function handleFillForm(params) {
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.type === 'console') {
     consoleMessages.push({ level: msg.level, text: msg.text, timestamp: Date.now(), url: sender.tab?.url });
+    if (consoleMessages.length > 500) consoleMessages = consoleMessages.slice(-500);
   } else if (msg.type === 'getStatus') {
     respond(buildStatusPayload());
   } else if (msg.type === 'setPort') {
