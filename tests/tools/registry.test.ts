@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { allTools, toolMap } from '../../mcp-server/src/tools/index.js';
 
 describe('Tool Registry', () => {
-  it('has 22 tools registered', () => {
-    expect(allTools.length).toBe(22);
+  it('has 24 tools registered', () => {
+    expect(allTools.length).toBe(24);
   });
 
   it('all tools have unique names', () => {
