@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { allTools } from '../mcp-server/dist/tools/index.js';
+import { hubToken } from './token.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HUB_PORT = parseInt(process.env.HUB_PORT || '7226', 10);
@@ -59,7 +60,7 @@ const httpBridge = {
     await ensureHub();
     const res = await fetch(`${HUB}/call`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Token': hubToken() },
       body: JSON.stringify({ tool, params, agent: agentName() }),
       signal: AbortSignal.timeout(120_000),
     });

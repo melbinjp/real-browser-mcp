@@ -21,6 +21,17 @@ Each CLI is pointed at the shim:
 Ports: `WS_PORT` (default 7225) for the extension, `HUB_PORT` (default 7226) for
 agents.
 
+## Who may call the hub
+
+Any web page can send a request to 127.0.0.1, and a command such as
+`browser_evaluate` runs code in the person's logged-in tabs. So the hub takes a
+call only with the secret in `~/.real-browser-mcp/hub-token`, which it makes on
+first start and which only the user's account can read. The shim sends it. A
+request that carries an `Origin` header, which a browser adds to every request
+from a page, is refused, and so is one addressed to any host name other than
+127.0.0.1 or localhost. `RB_HUB_TOKEN_FILE` moves the file. An agent session
+that started before this lock must be restarted.
+
 ## Install this fork on another device
 
 This fork is not in the Chrome Web Store or on npm, so the store extension and

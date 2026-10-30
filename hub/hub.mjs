@@ -13,11 +13,23 @@
 
 import http from 'http';
 import { ExtensionBridge } from '../mcp-server/dist/bridge.js';
+import { TOKEN_FILE, hubToken, tokenMatches } from './token.mjs';
 
 const WS_PORT = parseInt(process.env.WS_PORT || '7225', 10);
 const HTTP_PORT = parseInt(process.env.HUB_PORT || '7226', 10);
 
 const bridge = new ExtensionBridge({ port: WS_PORT });
+const TOKEN = hubToken();
+
+// Any web page can send a request to 127.0.0.1, and a command such as
+// browser_evaluate runs code in the person's logged-in tabs. So a call needs
+// the secret from the token file. A browser also adds Origin to a request from
+// a page, and a Host other than this address means a hostname that was pointed
+// here (DNS rebinding); both are refused before the secret is checked.
+function fromThisMachine(req) {
+  if (req.headers.origin) return false;
+  return req.headers.host === `127.0.0.1:${HTTP_PORT}` || req.headers.host === `localhost:${HTTP_PORT}`;
+}
 
 function send(res, code, body) {
   const payload = JSON.stringify(body);
@@ -29,11 +41,18 @@ function send(res, code, body) {
 }
 
 const server = http.createServer((req, res) => {
+  if (!fromThisMachine(req)) {
+    return send(res, 403, { success: false, error: 'Calls from web pages are refused' });
+  }
+
   if (req.method === 'GET' && req.url === '/status') {
     return send(res, 200, { ok: true, connected: bridge.isConnected(), wsPort: WS_PORT });
   }
 
   if (req.method === 'POST' && req.url === '/call') {
+    if (!tokenMatches(req.headers['x-hub-token'], TOKEN)) {
+      return send(res, 403, { success: false, error: `No valid X-Hub-Token. Shims read it from ${TOKEN_FILE}; restart an agent whose shim predates the lock.` });
+    }
     let body = '';
     req.on('data', chunk => {
       body += chunk;

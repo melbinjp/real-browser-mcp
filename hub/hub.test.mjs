@@ -7,6 +7,7 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { hubToken } from './token.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const AGENTS = ['claude', 'agy', 'codex'];
@@ -73,6 +74,32 @@ try {
     console.log('FAIL: the three agents saw different tool lists');
   } else {
     console.log(`PASS: all three agents share one browser, ${results[0]} tools each`);
+  }
+
+  // A call through a shim reaches the hub. With no browser connected the
+  // answer is an error from the extension side, which still proves the hub let
+  // the shim in.
+  const call = await rpc(shims[0], 3, 'tools/call', { name: 'browser_tabs', arguments: { action: 'list' } });
+  const text = call.result?.content?.[0]?.text || '';
+  if (/X-Hub-Token|web pages are refused/.test(text)) {
+    failed = true;
+    console.log('FAIL: the hub refused a shim:', text);
+  } else {
+    console.log('PASS: a shim call reaches the hub');
+  }
+
+  // What a web page could send to this machine must be refused.
+  const HUB = `http://127.0.0.1:${process.env.HUB_PORT || '7226'}`;
+  const body = JSON.stringify({ tool: 'browser_tabs', params: { action: 'list' } });
+  const attempts = {
+    'no token': { 'Content-Type': 'text/plain' },
+    'wrong token': { 'X-Hub-Token': 'x'.repeat(64) },
+    'token but from a web page': { 'X-Hub-Token': hubToken(), Origin: 'https://example.com' },
+  };
+  for (const [name, headers] of Object.entries(attempts)) {
+    const res = await fetch(`${HUB}/call`, { method: 'POST', headers, body });
+    if (res.status === 403) console.log(`PASS: refused, ${name}`);
+    else { failed = true; console.log(`FAIL: accepted, ${name} (${res.status})`); }
   }
 } catch (err) {
   failed = true;
