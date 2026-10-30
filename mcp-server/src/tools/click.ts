@@ -5,7 +5,7 @@ import { textResult } from './types.js';
 export const clickTool: ToolDefinition = {
   name: 'browser_click',
   description:
-    'Click an element on the page using a ref from snapshot, a CSS selector, or viewport coordinates. Coordinates are the fallback when an element cannot be addressed: read them off a screenshot and click the point directly.',
+    'Dispatch a trusted click using a main-frame ref/selector or top-level screenshot coordinates in CSS pixels. Capture a screenshot first to stabilize the debugger viewport. Success confirms input dispatch; verify the application result before retrying a submission.',
   inputSchema: z.object({
     ref: z.string().optional().describe('Element reference from snapshot (e.g. "e12")'),
     selector: z.string().optional().describe('CSS selector for the element'),

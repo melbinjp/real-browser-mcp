@@ -7,6 +7,7 @@ import { scrollTool } from './scroll.js';
 import { pressKeyTool } from './press-key.js';
 import { waitTool } from './wait.js';
 import { snapshotTool } from './snapshot.js';
+import { mediaTool } from './media.js';
 import { screenshotTool } from './screenshot.js';
 import { consoleTool } from './console.js';
 import { networkTool } from './network.js';
@@ -32,6 +33,7 @@ export const allTools: ToolDefinition[] = [
   pressKeyTool,
   waitTool,
   snapshotTool,
+  mediaTool,
   screenshotTool,
   consoleTool,
   networkTool,

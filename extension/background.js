@@ -1,3 +1,9 @@
+import { createInteraction, keyEvent, bounded } from './interaction.js';
+const interaction = createInteraction(chrome);
+let commandQueue = Promise.resolve();
+const selectedFrames = new Map();
+let requestFrameId = 0;
+
 const DEFAULT_WS_PORT = 7225;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
@@ -68,7 +74,8 @@ function connect() {
           ws.send(JSON.stringify({ type: 'pong' }));
           return;
         }
-        await handleMessage(msg);
+        commandQueue = commandQueue.then(() => handleMessage(msg), () => handleMessage(msg));
+        await commandQueue;
       } catch (err) {
         console.error('[RealBrowser] Message error:', err);
       }
@@ -213,6 +220,7 @@ async function dispatch(tool, params) {
     browser_press_key: handlePressKey,
     browser_wait: handleWait,
     browser_snapshot: handleSnapshot,
+    browser_media: handleMedia,
     browser_screenshot: handleScreenshot,
     browser_console: handleConsole,
     browser_network: handleNetwork,
@@ -232,6 +240,8 @@ async function dispatch(tool, params) {
     browser_text: handleGetPageText,
   };
 
+  const tab = await getActiveTab().catch(() => null);
+  requestFrameId = params.frameId ?? selectedFrames.get(tab?.id) ?? 0;
   const handler = handlers[tool];
   if (!handler) throw new Error(`Unknown tool: ${tool}`);
   return handler(params);
@@ -247,7 +257,7 @@ async function getActiveTab() {
 
 async function execInTab(tabId, func, args = []) {
   const sanitized = args.map(a => a === undefined ? null : a);
-  const results = await chrome.scripting.executeScript({ target: { tabId }, func, args: sanitized });
+  const results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [requestFrameId] }, func, args: sanitized });
   return results[0]?.result;
 }
 
@@ -279,8 +289,12 @@ async function handleNavigate(params) {
 async function handleClick(params) {
   const { ref, selector, x: px, y: py, button = 'left', doubleClick = false } = params;
   const tab = await getActiveTab();
+  // Screenshot coordinates always refer to the top-level viewport.
+  if (!ref && !selector && px != null && py != null) requestFrameId = 0;
 
-  return execInTab(tab.id, (_ref, _sel, _px, _py, _btn, _dbl) => {
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  const point = await execInTab(tab.id, (_ref, _sel, _px, _py, _btn, _dbl) => {
     // Refs and selectors miss anything inside a shadow root, so the lookup
     // descends through open shadow roots before giving up.
     function deepQuery(sel) {
@@ -323,40 +337,16 @@ async function handleClick(params) {
     const rect = el.getBoundingClientRect();
     const x = usingPoint ? _px : rect.left + rect.width / 2;
     const y = usingPoint ? _py : rect.top + rect.height / 2;
-    const btnVal = _btn === 'left' ? 0 : _btn === 'right' ? 2 : 1;
-    const init = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: btnVal };
-
-    // elementFromPoint often resolves to a non-focusable inner node (e.g. a
-    // <p> inside a contenteditable ancestor). Calling .focus() on that is a
-    // silent no-op, so climb to the nearest element that can actually take
-    // focus before focusing, while still dispatching the mouse events on the
-    // node actually under the cursor.
-    function nearestFocusable(node) {
-      let cur = node;
-      while (cur) {
-        if (cur.isContentEditable) return cur.closest('[contenteditable="true"], [contenteditable=""]') || cur;
-        if (cur.tabIndex >= 0 || /^(input|textarea|select|button|a)$/i.test(cur.tagName || '')) return cur;
-        cur = cur.parentElement;
-      }
-      return node;
+    if (rect.width <= 0 || rect.height <= 0 || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return {success:false,error:'Target is outside the visible viewport'};
+    if (document.elementFromPoint(x,y) !== el && !el.contains(document.elementFromPoint(x,y))) {
+      const hit = document.elementFromPoint(x,y);
+      if (!hit?.shadowRoot) return {success:false,error:'Target is covered by another element'};
     }
-
-    el.dispatchEvent(new MouseEvent('mouseover', init));
-    el.dispatchEvent(new MouseEvent('mousedown', init));
-    const focusTarget = nearestFocusable(el);
-    if (focusTarget && focusTarget.focus) focusTarget.focus();
-    el.dispatchEvent(new MouseEvent('mouseup', init));
-    el.dispatchEvent(new MouseEvent('click', init));
-
-    if (_dbl) {
-      el.dispatchEvent(new MouseEvent('mousedown', init));
-      el.dispatchEvent(new MouseEvent('mouseup', init));
-      el.dispatchEvent(new MouseEvent('click', init));
-      el.dispatchEvent(new MouseEvent('dblclick', init));
-    }
-
-    return { success: true };
+    return { success: true, x, y };
   }, [ref, selector, px, py, button, doubleClick]);
+  if (!point?.success) return point;
+  if (requestFrameId !== 0) throw new Error('FRAME_COORDINATES: use top-level screenshot coordinates for trusted clicks; frame selectors are supported by snapshot, type, keys and scroll.');
+  return interaction.mouseClick(tab.id, point.x, point.y, button, doubleClick);
 }
 
 async function handleType(params) {
@@ -407,7 +397,9 @@ async function handleTypeTrusted(params) {
   const { ref, selector, text, clear = false } = params;
   const tab = await getActiveTab();
 
-  const focused = await execInTab(tab.id, (_ref, _sel) => {
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  const focused = (ref || selector) ? await execInTab(tab.id, (_ref, _sel) => {
     // Deep lookup: the real caret is often inside an open shadow root (a web
     // component's own contenteditable or textarea), which plain
     // document.querySelector cannot see. Fall back to whatever already has
@@ -437,17 +429,30 @@ async function handleTypeTrusted(params) {
     if (!el && _sel) el = deepQuery(_sel);
     if (!el && !_ref && !_sel) el = deepActiveElement();
     if (!el) return { success: false, error: 'Element not found' };
+    if (el.tagName === 'IFRAME') return { success:false, error:'Target the editable element in its frame, not the iframe container' };
     el.scrollIntoView({ behavior: 'instant', block: 'center' });
     el.focus();
     if (el.setSelectionRange && typeof el.value === 'string') {
       el.setSelectionRange(el.value.length, el.value.length);
     }
     return { success: true };
-  }, [ref, selector]);
+  }, [ref, selector]) : { success: true };
 
   if (focused && focused.success === false) return focused;
 
-  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  const carets = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
+    func: () => {
+      let el = document.activeElement;
+      while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+      return document.hasFocus() && !!el && (el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && !['button','submit','reset','checkbox','radio','file','hidden'].includes(el.type))) && !el.disabled && !el.readOnly;
+    },
+  });
+  if (!carets.some(frame => frame.result === true)) {
+    throw new Error('NO_EDITABLE_FOCUS: click an editable field or select its frame and selector first. No text or select-all was sent.');
+  }
+
+  await interaction.ensureDebugger(tab.id);
   try {
     if (clear) {
       // select all, then let the deletion go through the page's own handling
@@ -466,7 +471,7 @@ async function handleTypeTrusted(params) {
     await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.insertText', { text });
     return { success: true, typed: text, trusted: true };
   } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+    // Debugger retained until another tab is selected or the user cancels it.
   }
 }
 
@@ -514,34 +519,21 @@ async function handleScroll(params) {
 async function handlePressKey(params) {
   const { key, modifiers = [], ref, selector } = params;
   const tab = await getActiveTab();
-
-  return execInTab(tab.id, (_key, _mods, _ref, _sel) => {
-    let target = document.activeElement || document.body;
-    if (_ref) {
-      const el = document.querySelector(`[data-mcp-ref="${_ref}"]`);
-      if (el) { el.focus(); target = el; }
-    } else if (_sel) {
-      const el = document.querySelector(_sel);
-      if (el) { el.focus(); target = el; }
-    }
-
-    const init = {
-      key: _key,
-      code: _key.length === 1 ? `Key${_key.toUpperCase()}` : _key,
-      bubbles: true,
-      cancelable: true,
-      ctrlKey: _mods.includes('ctrl'),
-      altKey: _mods.includes('alt'),
-      shiftKey: _mods.includes('shift'),
-      metaKey: _mods.includes('meta'),
-    };
-
-    target.dispatchEvent(new KeyboardEvent('keydown', init));
-    target.dispatchEvent(new KeyboardEvent('keypress', init));
-    target.dispatchEvent(new KeyboardEvent('keyup', init));
-
-    return { success: true, key: _key };
-  }, [key, modifiers, ref, selector]);
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  if (ref || selector) {
+    const found = await execInTab(tab.id, (ref, selector) => {
+      const el = document.querySelector(ref ? `[data-mcp-ref="${ref}"]` : selector);
+      if (!el || el.tagName === 'IFRAME') return false;
+      el.focus(); return true;
+    }, [ref, selector]);
+    if (!found) throw new Error('Editable/key target not found; select its frame first.');
+  }
+  const event = keyEvent(key, modifiers);
+  await chrome.debugger.sendCommand({tabId:tab.id}, 'Input.dispatchKeyEvent', {type:'rawKeyDown', ...event});
+  if (event.key === 'Enter' && !event.modifiers) await chrome.debugger.sendCommand({tabId:tab.id}, 'Input.dispatchKeyEvent', {type:'char', text:'\r', ...event});
+  await chrome.debugger.sendCommand({tabId:tab.id}, 'Input.dispatchKeyEvent', {type:'keyUp', ...event});
+  return {success:true, trusted:true, dispatched:true, key:event.key};
 }
 
 async function handleWait(params) {
@@ -772,6 +764,15 @@ async function handleSnapshot(params) {
     const root = _sel ? document.querySelector(_sel) : document.body;
     if (!root) return { success: false, error: 'Root element not found' };
 
+    // A new snapshot replaces the previous reference map, including nodes omitted
+    // by compact mode or a scoped snapshot. Otherwise querySelector can resolve
+    // an old generic node before the newly assigned interactive element.
+    function clearRefs(el) {
+      if (!el || el.nodeType !== 1) return;
+      el.removeAttribute('data-mcp-ref');
+      for (const child of childrenOf(el)) clearRefs(child);
+    }
+    clearRefs(document.documentElement);
     const tree = _compact ? buildCompact(root) : buildFull(root, 0);
     return {
       success: true,
@@ -786,11 +787,18 @@ async function handleSnapshot(params) {
 async function handleScreenshot(params) {
   const { format = 'png', quality = 80 } = params;
   const tab = await getActiveTab();
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-    format,
-    quality: format === 'jpeg' ? quality : undefined,
-  });
-  return { success: true, format, data: dataUrl.split(',')[1] };
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  await hideOverlay(tab.id);
+  const readViewport = async () => (await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},func:()=>({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visibility:document.visibilityState})}))[0].result;
+  const viewport = await readViewport();
+  if (viewport.visibility !== 'visible') throw new Error(`PAGE_HIDDEN: tab ${tab.id}; focus this tab before capture. No screenshot returned.`);
+  const dataUrl = await bounded(chrome.tabs.captureVisibleTab(tab.windowId, {format,quality:format==='jpeg'?quality:undefined}), 4500, 'CAPTURE_TIMEOUT: Edge did not provide a fresh screenshot within 4.5 seconds.');
+  await interaction.visibleWindow(tab);
+  const current = await getActiveTab();
+  const after = await readViewport();
+  if (current.id !== tab.id || after.visibility !== 'visible' || after.width !== viewport.width || after.height !== viewport.height) throw new Error('CAPTURE_CHANGED: tab/window/viewport changed during capture; discard and request a new screenshot.');
+  return {success:true,format,data:dataUrl.split(',')[1],tabId:tab.id,windowId:tab.windowId,capturedAt:new Date().toISOString(),viewport,coordinateSpace:'CSS pixels',raster:{width:Math.round(viewport.width*viewport.dpr),height:Math.round(viewport.height*viewport.dpr)}};
 }
 
 async function handleConsole(params) {
@@ -812,11 +820,12 @@ async function handleNetwork(params) {
 }
 
 async function handleTabs(params) {
-  const { action, tabId, url } = params;
+  const { action, tabId, url, frameId } = params;
   switch (action) {
     case 'list': {
-      const tabs = await chrome.tabs.query({ currentWindow: true });
-      return { success: true, tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active })) };
+      const tabs = await chrome.tabs.query({});
+      const windows = await chrome.windows.getAll();
+      return { success: true, extensionVersion:chrome.runtime.getManifest().version, windows:windows.map(w=>({id:w.id,state:w.state,focused:w.focused})), tabs: tabs.map(t => ({ id: t.id,windowId:t.windowId,url: t.url,title: t.title,active: t.active })) };
     }
     case 'create': {
       const t = await chrome.tabs.create({ url: url || 'about:blank' });
@@ -829,8 +838,18 @@ async function handleTabs(params) {
     }
     case 'focus': {
       if (!tabId) throw new Error('tabId required');
-      await chrome.tabs.update(tabId, { active: true });
-      return { success: true, focused: tabId };
+      return interaction.focusTab(tabId);
+    }
+    case 'frames': {
+      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab();
+      const frames = await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},func:()=>({url:location.href,title:document.title})});
+      return {success:true,tabId:tab.id,selectedFrameId:selectedFrames.get(tab.id)||0,frames:frames.map(f=>({frameId:f.frameId,documentId:f.documentId,...f.result}))};
+    }
+    case 'select_frame': {
+      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab();
+      if (!Number.isInteger(frameId) || frameId < 0) throw new Error('A frameId from browser_tabs frames is required');
+      await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[frameId]},func:()=>document.title});
+      selectedFrames.set(tab.id,frameId); return {success:true,tabId:tab.id,frameId};
     }
     default: throw new Error(`Unknown action: ${action}`);
   }
@@ -903,11 +922,26 @@ async function handleGetPageText(params) {
   }, args);
 }
 
+// Read only media actually exposed in the selected document's DOM. This also
+// supports recovering generated data-URL previews when the site's export hangs.
+async function handleMedia(params) {
+  const tab = await getActiveTab();
+  return execInTab(tab.id, (includeData) => ({
+    success: true,
+    media: Array.from(document.querySelectorAll('video,audio,img')).map(el => {
+      const src = el.currentSrc || el.src || '';
+      return { tag: el.tagName.toLowerCase(), source: src.startsWith('data:') && !includeData ? undefined : src,
+        embedded: src.startsWith('data:'), length: src.length, alt: el.getAttribute('alt'),
+        duration: Number.isFinite(el.duration) ? el.duration : undefined };
+    })
+  }), [params.includeData === true]);
+}
+
 async function handleEvaluate(params) {
   const { expression } = params;
   const tab = await getActiveTab();
 
-  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  await interaction.ensureDebugger(tab.id);
   try {
     const { result, exceptionDetails } = await chrome.debugger.sendCommand(
       { tabId: tab.id },
@@ -919,7 +953,7 @@ async function handleEvaluate(params) {
     }
     return { success: true, result: result.value };
   } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+    // Debugger retained until another tab is selected or the user cancels it.
   }
 }
 
@@ -927,7 +961,9 @@ async function handleClickByText(params) {
   const { text, index = 0, exact = false } = params;
   const tab = await getActiveTab();
 
-  return execInTab(tab.id, (_text, _index, _exact) => {
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  const point = await execInTab(tab.id, (_text, _index, _exact) => {
     const textLower = _text.toLowerCase();
     const candidates = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
@@ -961,16 +997,11 @@ async function handleClickByText(params) {
     const rect = target.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    const init = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-
-    target.dispatchEvent(new MouseEvent('mouseover', init));
-    target.dispatchEvent(new MouseEvent('mousedown', init));
-    if (target.focus) target.focus();
-    target.dispatchEvent(new MouseEvent('mouseup', init));
-    target.dispatchEvent(new MouseEvent('click', init));
-
-    return { success: true, clicked: candidates[_index].text, matchCount: candidates.length };
+    return { success:true,x,y,clicked:candidates[_index].text,matchCount:candidates.length };
   }, [text, index, exact]);
+  if (!point?.success) return point;
+  if (requestFrameId !== 0) throw new Error('Use top-level screenshot coordinates for frame clicks.');
+  return {...await interaction.mouseClick(tab.id,point.x,point.y),clicked:point.clicked,matchCount:point.matchCount};
 }
 
 async function handleDialog(params) {
@@ -1029,11 +1060,12 @@ async function handleDialog(params) {
 }
 
 async function handleRunAction(params) {
+  if (requestFrameId !== 0) throw new Error('run_action is top-frame only. Use frame snapshot/type/keys, or select_frame 0.');
   const { code, actionParams = {} } = params;
   if (!code) throw new Error('code is required');
   const tab = await getActiveTab();
 
-  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  await interaction.ensureDebugger(tab.id);
   try {
     const paramsJson = JSON.stringify(actionParams);
     const expression = `(async function() { try { var tool = (${code}); if (tool && typeof tool.execute === "function") { return await tool.execute(${paramsJson}); } return { error: "No execute function found" }; } catch(e) { return { error: e.message, stack: e.stack }; } })()`;
@@ -1049,7 +1081,7 @@ async function handleRunAction(params) {
     }
     return { success: true, result: result.value };
   } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+    // Debugger retained until another tab is selected or the user cancels it.
   }
 }
 
@@ -1059,7 +1091,7 @@ async function handleUploadFile(params) {
   const filePaths = fileList || (filePath ? [filePath] : []);
   if (filePaths.length === 0) throw new Error('filePath or files required');
 
-  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  await interaction.ensureDebugger(tab.id);
   try {
     await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.enable', {});
     const { root } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.getDocument', {});
@@ -1082,7 +1114,7 @@ async function handleUploadFile(params) {
 
     return { success: true, files: filePaths, selector: sel };
   } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+    // Debugger retained until another tab is selected or the user cancels it.
   }
 }
 
@@ -1090,6 +1122,9 @@ async function handleDrag(params) {
   const { startRef, startSelector, endRef, endSelector, startX, startY, endX, endY, steps = 10 } = params;
   const tab = await getActiveTab();
 
+  await interaction.visibleWindow(tab);
+  await interaction.ensureDebugger(tab.id);
+  if (requestFrameId !== 0 && (startRef || startSelector || endRef || endSelector)) throw new Error("Use top-frame screenshot coordinates for frame dragging");
   let sx = startX, sy = startY, ex = endX, ey = endY;
 
   if (sx == null || sy == null || ex == null || ey == null) {
@@ -1116,7 +1151,7 @@ async function handleDrag(params) {
     throw new Error('Could not determine drag coordinates. Provide refs/selectors or explicit x,y coordinates.');
   }
 
-  await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+  await interaction.ensureDebugger(tab.id);
   try {
     await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchMouseEvent', {
       type: 'mousePressed', x: sx, y: sy, button: 'left', clickCount: 1,
@@ -1128,7 +1163,7 @@ async function handleDrag(params) {
         type: 'mouseMoved',
         x: Math.round(sx + (ex - sx) * t),
         y: Math.round(sy + (ey - sy) * t),
-        button: 'left',
+        button: 'left', buttons: 1,
       });
     }
 
@@ -1138,7 +1173,7 @@ async function handleDrag(params) {
 
     return { success: true, from: { x: sx, y: sy }, to: { x: ex, y: ey } };
   } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+    // Debugger retained until another tab is selected or the user cancels it.
   }
 }
 
