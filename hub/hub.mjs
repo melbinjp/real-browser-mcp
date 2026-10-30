@@ -19,11 +19,14 @@ const WS_PORT = parseInt(process.env.WS_PORT || '7225', 10);
 const HTTP_PORT = parseInt(process.env.HUB_PORT || '7226', 10);
 
 const bridge = new ExtensionBridge({ port: WS_PORT });
-const TOKEN = hubToken();
+// Make the secret file now, so it exists before the first agent asks.
+hubToken();
 
 // Any web page can send a request to 127.0.0.1, and a command such as
 // browser_evaluate runs code in the person's logged-in tabs. So a call needs
-// the secret from the token file. A browser also adds Origin to a request from
+// the secret from the token file, read again on every call: if the file is
+// deleted, the next reader makes a new one, and the hub and the shims still
+// agree, and deleting it is how the secret is changed. A browser also adds Origin to a request from
 // a page, and a Host other than this address means a hostname that was pointed
 // here (DNS rebinding); both are refused before the secret is checked.
 function fromThisMachine(req) {
@@ -50,7 +53,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/call') {
-    if (!tokenMatches(req.headers['x-hub-token'], TOKEN)) {
+    if (!tokenMatches(req.headers['x-hub-token'], hubToken())) {
       return send(res, 403, { success: false, error: `No valid X-Hub-Token. Shims read it from ${TOKEN_FILE}; restart an agent whose shim predates the lock.` });
     }
     let body = '';

@@ -32,6 +32,10 @@ from a page, is refused, and so is one addressed to any host name other than
 127.0.0.1 or localhost. `RB_HUB_TOKEN_FILE` moves the file. An agent session
 that started before this lock must be restarted.
 
+The hub and the shims read the file on every call. To change the secret, delete
+the file: the next call makes a new one, and the old secret stops working at
+once, with no restart.
+
 ## Install this fork on another device
 
 This fork is not in the Chrome Web Store or on npm, so the store extension and

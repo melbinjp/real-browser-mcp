@@ -7,7 +7,8 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { hubToken } from './token.mjs';
+import { unlinkSync } from 'fs';
+import { TOKEN_FILE, hubToken } from './token.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const AGENTS = ['claude', 'agy', 'codex'];
@@ -101,6 +102,18 @@ try {
     if (res.status === 403) console.log(`PASS: refused, ${name}`);
     else { failed = true; console.log(`FAIL: accepted, ${name} (${res.status})`); }
   }
+
+  // Deleting the secret file changes the secret: the running hub and the
+  // shims agree on the new one, and the old one stops working.
+  const oldToken = hubToken();
+  unlinkSync(TOKEN_FILE);
+  const after = await rpc(shims[1], 3, 'tools/call', { name: 'browser_tabs', arguments: { action: 'list' } });
+  const afterText = after.result?.content?.[0]?.text || '';
+  if (/X-Hub-Token/.test(afterText)) { failed = true; console.log('FAIL: a shim was refused after the secret file was deleted'); }
+  else console.log('PASS: a shim works after the secret file was deleted');
+  const stale = await fetch(`${HUB}/call`, { method: 'POST', headers: { 'X-Hub-Token': oldToken }, body });
+  if (stale.status === 403) console.log('PASS: refused, the secret from before the deletion');
+  else { failed = true; console.log(`FAIL: accepted the old secret (${stale.status})`); }
 } catch (err) {
   failed = true;
   console.log('FAIL:', err.message);
