@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocket } from 'ws';
-import { ExtensionBridge } from '../mcp-server/src/bridge.js';
+import { ExtensionBridge, canResend } from '../mcp-server/src/bridge.js';
 
 let portCounter = 19230;
 function nextPort() { return portCounter++; }
@@ -106,4 +106,20 @@ describe('ExtensionBridge', () => {
 
     await expect(bridge.callTool('browser_click', {})).rejects.toThrow();
   }, 10_000);
+});
+
+describe('canResend', () => {
+  it('does not resend calls that change the page', () => {
+    for (const tool of ['browser_click', 'browser_type_trusted', 'browser_press_key', 'browser_drag', 'browser_fill_form', 'browser_evaluate', 'browser_webmcp_execute_tool']) {
+      expect(canResend(tool, {})).toBe(false);
+    }
+    expect(canResend('browser_tabs', { action: 'create' })).toBe(false);
+    expect(canResend('browser_tabs', { action: 'close' })).toBe(false);
+  });
+  it('resends reads', () => {
+    for (const tool of ['browser_snapshot', 'browser_screenshot', 'browser_navigate', 'browser_text']) {
+      expect(canResend(tool, {})).toBe(true);
+    }
+    expect(canResend('browser_tabs', { action: 'list' })).toBe(true);
+  });
 });

@@ -37,6 +37,29 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   browser_fill_form: 15_000,
 };
 
+// A timed-out call can still run in the browser later. Resending a call that
+// changes the page would then do the action twice, so these are not resent.
+const NOT_RESENT = new Set([
+  'browser_click',
+  'browser_click_text',
+  'browser_type',
+  'browser_type_trusted',
+  'browser_press_key',
+  'browser_scroll',
+  'browser_drag',
+  'browser_select',
+  'browser_fill_form',
+  'browser_upload_file',
+  'browser_run_action',
+  'browser_evaluate',
+  'browser_webmcp_execute_tool',
+]);
+
+export function canResend(tool: string, params: Record<string, unknown>): boolean {
+  if (tool === 'browser_tabs') return params.action !== 'create' && params.action !== 'close';
+  return !NOT_RESENT.has(tool);
+}
+
 export class ExtensionBridge {
   private wss: WebSocketServer | null = null;
   private client: WebSocket | null = null;
@@ -255,7 +278,9 @@ export class ExtensionBridge {
 
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
-        if (retryCount < this.maxRetries) {
+        if (!canResend(tool, params)) {
+          reject(new Error(`Tool call timed out: ${tool}. It was not sent again, because it may still run in the browser. Check the page before you try again.`));
+        } else if (retryCount < this.maxRetries) {
           console.error(`[Bridge] Timeout on ${tool}, retry ${retryCount + 1}/${this.maxRetries}`);
           this.sendToolCall(tool, params, retryCount + 1).then(resolve, reject);
         } else {

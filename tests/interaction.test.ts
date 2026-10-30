@@ -1,11 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 // The production extension module is deliberately dependency-free.
 // @ts-ignore JavaScript extension module
-import { createInteraction, keyEvent, bounded } from '../extension/interaction.js';
+import { createInteraction, createCommandQueue, keyEvent, bounded } from '../extension/interaction.js';
 // @ts-ignore JavaScript extension module
 import { createDebuggerSession } from '../extension/debugger-session.js';
 
-function browser(state = 'normal') {
+function browser(state = 'normal', visibility: string | Promise<never> = 'visible') {
   let listener: (source: any) => void = () => {};
   const win = { id: 8, state, focused: false };
   const api = {
@@ -19,6 +19,7 @@ function browser(state = 'normal') {
       update: vi.fn(async (_id, change) => Object.assign(win, change)),
     },
     tabs: { get: vi.fn(async id => ({ id, windowId: 8 })), update: vi.fn(async () => {}) },
+    scripting: { executeScript: vi.fn(async () => [{ result: await visibility }]) },
   };
   return { api, win, detach: (id: number) => listener({ tabId: id }) };
 }
@@ -63,6 +64,81 @@ describe('browser interaction reliability', () => {
     api.debugger.attach.mockRejectedValueOnce(new Error('Another debugger is already attached'));
     api.debugger.sendCommand.mockRejectedValueOnce(new Error('not owned'));
     await expect(interactionFor(api).ensureDebugger(12)).rejects.toThrow('DEBUGGER_BUSY');
+  });
+  it('rejects a hidden page, such as a covered window, before any input', async () => {
+    const { api } = browser('normal', 'hidden');
+    await expect(interactionFor(api).visibleWindow({ id: 12, windowId: 8 })).rejects.toThrow('WINDOW_HIDDEN');
+    expect(api.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+  it('sends input to a covered window when the browser takes it', async () => {
+    const { api } = browser('normal', 'hidden');
+    await interactionFor(api).inputReady({ id: 12, windowId: 8 });
+    const sent = api.debugger.sendCommand.mock.calls.map(c => c[1]);
+    expect(sent).toEqual(['Emulation.setFocusEmulationEnabled', 'Page.setWebLifecycleState', 'Input.dispatchMouseEvent']);
+    expect(api.debugger.detach).not.toHaveBeenCalled();
+  });
+  it('fails fast and cancels the probe when the browser holds input', async () => {
+    vi.useFakeTimers();
+    try {
+      const { api } = browser('minimized', 'hidden');
+      api.debugger.sendCommand.mockImplementation(async (_t, method) => {
+        if (method === 'Input.dispatchMouseEvent') await new Promise(() => {});
+        return {};
+      });
+      const result = expect(interactionFor(api).inputReady({ id: 12, windowId: 8 })).rejects.toThrow('WINDOW_HIDDEN');
+      await vi.advanceTimersByTimeAsync(2000); await result;
+      expect(api.debugger.detach).toHaveBeenCalledWith({ tabId: 12 });
+    } finally { vi.useRealTimers(); }
+  });
+  it('does not probe a visible page', async () => {
+    const { api } = browser();
+    await interactionFor(api).inputReady({ id: 12, windowId: 8 });
+    expect(api.debugger.attach).not.toHaveBeenCalled();
+  });
+  it('accepts a visible page and a page that takes no scripts', async () => {
+    const { api } = browser();
+    await expect(interactionFor(api).visibleWindow({ id: 12, windowId: 8 })).resolves.toMatchObject({ id: 8 });
+    api.scripting.executeScript.mockRejectedValueOnce(new Error('Cannot access a chrome:// URL'));
+    await expect(interactionFor(api).visibleWindow({ id: 12, windowId: 8 })).resolves.toMatchObject({ id: 8 });
+  });
+  it('rejects a page that does not answer the visibility check', async () => {
+    vi.useFakeTimers();
+    try {
+      const { api } = browser('normal', new Promise<never>(() => {}));
+      const result = expect(interactionFor(api).visibleWindow({ id: 12, windowId: 8 })).rejects.toThrow('PAGE_UNRESPONSIVE');
+      await vi.advanceTimersByTimeAsync(3000); await result;
+    } finally { vi.useRealTimers(); }
+  });
+  it('gives up on a stuck command and runs the next one', async () => {
+    vi.useFakeTimers();
+    try {
+      const ran: string[] = [];
+      const onStuck = vi.fn(async () => {});
+      const enqueue = createCommandQueue(async (msg: any) => {
+        ran.push(msg.id);
+        if (msg.id === 'stuck') await new Promise(() => {});
+      }, { limitFor: () => 1000, onStuck });
+      const first = enqueue({ id: 'stuck' });
+      const second = enqueue({ id: 'next' });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(ran).toEqual(['stuck']);
+      await vi.advanceTimersByTimeAsync(1);
+      await first; await second;
+      expect(onStuck).toHaveBeenCalledWith({ id: 'stuck' });
+      expect(ran).toEqual(['stuck', 'next']);
+      expect(onStuck).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+  it('runs commands one at a time, also after one fails', async () => {
+    const order: string[] = [];
+    const enqueue = createCommandQueue(async (msg: any) => {
+      order.push(`start ${msg.id}`);
+      await new Promise(r => setTimeout(r, 5));
+      order.push(`end ${msg.id}`);
+      if (msg.id === 'a') throw new Error('failed');
+    }, { limitFor: () => 1000, onStuck: async () => {} });
+    await Promise.all([enqueue({ id: 'a' }), enqueue({ id: 'b' })]);
+    expect(order).toEqual(['start a', 'end a', 'start b', 'end b']);
   });
   it('maps native editing and navigation keys and rejects unknown keys', () => {
     expect(keyEvent('Ctrl+A')).toMatchObject({ key: 'A', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });

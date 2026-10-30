@@ -1,7 +1,20 @@
-import { createInteraction, keyEvent, bounded } from './interaction.js';
+import { createInteraction, createCommandQueue, keyEvent, bounded } from './interaction.js';
 import { createTabGroups } from './tab-groups.js';
 import { createDebuggerSession } from './debugger-session.js';
-let commandQueue = Promise.resolve();
+// Commands run one at a time. A command still running after its limit is
+// answered with an error and its debugger input is cancelled, so one stuck
+// command cannot hold every agent. Its late answer is dropped.
+const COMMAND_LIMIT_MS = { browser_navigate: 65_000, browser_wait: 65_000 };
+const abandonedCommands = new Set();
+const enqueueCommand = createCommandQueue(handleMessage, {
+  limitFor: msg => COMMAND_LIMIT_MS[msg.tool] ?? 35_000,
+  async onStuck(msg) {
+    const seconds = (COMMAND_LIMIT_MS[msg.tool] ?? 35_000) / 1000;
+    sendResponse(msg.id, { success: false, error: `COMMAND_STUCK: ${msg.tool} did not finish in ${seconds} seconds. The debugger was detached to cancel its pending input. The action may have partly run, so check the page before you try again.` });
+    abandonedCommands.add(msg.id);
+    await debuggerSession.abort();
+  },
+});
 const selectedFrames = new Map();
 let requestFrameId = 0;
 
@@ -83,8 +96,7 @@ function connect() {
           ws.send(JSON.stringify({ type: 'pong' }));
           return;
         }
-        commandQueue = commandQueue.then(() => handleMessage(msg), () => handleMessage(msg));
-        await commandQueue;
+        await enqueueCommand(msg);
       } catch (err) {
         console.error('[RealBrowser] Message error:', err);
       }
@@ -190,8 +202,7 @@ async function handleMessage(msg) {
 
   let tabId = null;
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    tabId = tab?.id;
+    tabId = (await getActiveTab()).id;
   } catch {}
 
   currentActivity = tool;
@@ -212,6 +223,7 @@ async function handleMessage(msg) {
 }
 
 function sendResponse(id, response) {
+  if (abandonedCommands.delete(id)) return;
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ id, ...response }));
   }
@@ -230,6 +242,7 @@ async function dispatch(tool, params) {
     browser_wait: handleWait,
     browser_snapshot: handleSnapshot,
     browser_media: handleMedia,
+    browser_reload_extension: handleReloadExtension,
     browser_screenshot: handleScreenshot,
     browser_console: handleConsole,
     browser_network: handleNetwork,
@@ -258,7 +271,38 @@ async function dispatch(tool, params) {
 
 // --- Helpers ---
 
+// The tab the tools act on. browser_tabs select, create and focus set it, so
+// an agent can work on one tab while the person uses another. It is kept in
+// local storage because the service worker stops when idle and an extension
+// reload clears session storage; it is cleared when the browser starts,
+// because tab IDs are reused then. Without it, tools act on the active tab.
+let workingTabId;
+const WORKING_TAB_KEY = 'workingTabId';
+
+async function loadWorkingTab() {
+  if (workingTabId === undefined) {
+    try { workingTabId = (await chrome.storage.local.get(WORKING_TAB_KEY))[WORKING_TAB_KEY] ?? null; }
+    catch { workingTabId = null; }
+  }
+  return workingTabId;
+}
+
+async function setWorkingTab(tabId) {
+  workingTabId = tabId;
+  try { await chrome.storage.local.set({ [WORKING_TAB_KEY]: tabId }); } catch {}
+}
+
+chrome.runtime.onStartup.addListener(() => setWorkingTab(null));
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  if (await loadWorkingTab() === tabId) await setWorkingTab(null);
+});
+
 async function getActiveTab() {
+  const working = await loadWorkingTab();
+  if (working != null) {
+    try { return await chrome.tabs.get(working); } catch { await setWorkingTab(null); }
+  }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error('No active tab');
   return tab;
@@ -285,14 +329,6 @@ function mouseButtonsMask(button, down) {
   if (button === 'right') return 2;
   if (button === 'middle') return 4;
   return 1;
-}
-
-/** Bring the target tab to the front so the debug infobar and pointer are visible. */
-async function ensureTabFocused(tab) {
-  if (!tab?.id) return;
-  if (!tab.active) {
-    await chrome.tabs.update(tab.id, { active: true });
-  }
 }
 
 async function sendMouse(tabId, type, x, y, extras = {}) {
@@ -471,7 +507,7 @@ const debuggerSession = createDebuggerSession(chrome, {
 const interaction = createInteraction(chrome, debuggerSession);
 
 async function performPointerClick(tab, x, y, { button = 'left', doubleClick = false } = {}) {
-  await ensureTabFocused(tab);
+  await interaction.inputReady(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     await movePointer(tab.id, x, y, { attached, click: true });
 
@@ -509,7 +545,7 @@ async function performPointerClick(tab, x, y, { button = 'left', doubleClick = f
 }
 
 async function performPointerHover(tab, x, y) {
-  await ensureTabFocused(tab);
+  await interaction.inputReady(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     await movePointer(tab.id, x, y, { attached, click: false });
     if (!attached) {
@@ -563,7 +599,7 @@ async function handleClick(params) {
   // Screenshot coordinates always refer to the top-level viewport.
   if (!ref && !selector && px != null && py != null) requestFrameId = 0;
 
-  await interaction.visibleWindow(tab);
+  await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   const point = await execInTab(tab.id, (_ref, _sel, _px, _py, _btn, _dbl) => {
     // Refs and selectors miss anything inside a shadow root, so the lookup
@@ -668,7 +704,7 @@ async function handleTypeTrusted(params) {
   const { ref, selector, text, clear = false } = params;
   const tab = await getActiveTab();
 
-  await interaction.visibleWindow(tab);
+  await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   const focused = (ref || selector) ? await execInTab(tab.id, (_ref, _sel) => {
     // Deep lookup: the real caret is often inside an open shadow root (a web
@@ -790,7 +826,7 @@ async function handleScroll(params) {
 async function handlePressKey(params) {
   const { key, modifiers = [], ref, selector } = params;
   const tab = await getActiveTab();
-  await interaction.visibleWindow(tab);
+  await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   if (ref || selector) {
     const found = await execInTab(tab.id, (ref, selector) => {
@@ -1043,10 +1079,14 @@ async function handleSnapshot(params) {
 async function handleScreenshot(params) {
   const { format = 'png', quality = 80 } = params;
   const tab = await getActiveTab();
+  const readViewport = async () => (await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},func:()=>({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visibility:document.visibilityState})}))[0].result;
+  const win = await chrome.windows.get(tab.windowId);
+  if (!tab.active || win.state === 'minimized' || (await readViewport()).visibility !== 'visible') {
+    return captureOffscreen(tab, format, quality, readViewport);
+  }
   await interaction.visibleWindow(tab);
   await interaction.ensureDebugger(tab.id);
   await hideOverlay(tab.id);
-  const readViewport = async () => (await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},func:()=>({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visibility:document.visibilityState})}))[0].result;
   const viewport = await readViewport();
   if (viewport.visibility !== 'visible') throw new Error(`PAGE_HIDDEN: tab ${tab.id}; focus this tab before capture. No screenshot returned.`);
   const dataUrl = await bounded(chrome.tabs.captureVisibleTab(tab.windowId, {format,quality:format==='jpeg'?quality:undefined}), 4500, 'CAPTURE_TIMEOUT: Edge did not provide a fresh screenshot within 4.5 seconds.');
@@ -1055,6 +1095,47 @@ async function handleScreenshot(params) {
   const after = await readViewport();
   if (current.id !== tab.id || after.visibility !== 'visible' || after.width !== viewport.width || after.height !== viewport.height) throw new Error('CAPTURE_CHANGED: tab/window/viewport changed during capture; discard and request a new screenshot.');
   return {success:true,format,data:dataUrl.split(',')[1],tabId:tab.id,windowId:tab.windowId,capturedAt:new Date().toISOString(),viewport,coordinateSpace:'CSS pixels',raster:{width:Math.round(viewport.width*viewport.dpr),height:Math.round(viewport.height*viewport.dpr)}};
+}
+
+// A tab that is not on the screen has no pixels to copy from the window, so
+// the page renders the image through the debugger instead.
+// Page.captureScreenshot waits for a painted frame, which a tab off the
+// screen does not make. A screencast asks the page for frames itself.
+function screencastFrame(tabId, format, quality) {
+  return new Promise((resolve, reject) => {
+    const onEvent = (source, method, params) => {
+      if (source.tabId !== tabId || method !== 'Page.screencastFrame') return;
+      chrome.debugger.onEvent.removeListener(onEvent);
+      chrome.debugger.sendCommand({ tabId }, 'Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {});
+      chrome.debugger.sendCommand({ tabId }, 'Page.stopScreencast').catch(() => {});
+      resolve({ data: params.data });
+    };
+    chrome.debugger.onEvent.addListener(onEvent);
+    chrome.debugger.sendCommand({ tabId }, 'Page.startScreencast', { format, quality: format === 'jpeg' ? quality : undefined, everyNthFrame: 1 })
+      .catch(err => { chrome.debugger.onEvent.removeListener(onEvent); reject(err); });
+  });
+}
+
+async function captureOffscreen(tab, format, quality, readViewport) {
+  await interaction.inputReady(tab);
+  await interaction.ensureDebugger(tab.id);
+  await hideOverlay(tab.id);
+  const viewport = await readViewport();
+  let shot;
+  try {
+    shot = await bounded(screencastFrame(tab.id, format, quality), 5000, 'CAPTURE_TIMEOUT');
+  } catch (err) {
+    if (err.message === 'CAPTURE_TIMEOUT') await debuggerSession.abort();
+    throw new Error(`CAPTURE_FAILED: tab ${tab.id} is not on the screen and the browser gave no image (${err.message}). Use browser_tabs focus for tab ${tab.id} to capture it on the screen.`);
+  }
+  return {success:true,format,data:shot.data,tabId:tab.id,windowId:tab.windowId,capturedAt:new Date().toISOString(),offscreen:true,viewport,coordinateSpace:'CSS pixels',raster:{width:Math.round(viewport.width*viewport.dpr),height:Math.round(viewport.height*viewport.dpr)}};
+}
+
+// Lets an agent load changed extension files without a person on the
+// extensions page. The answer goes out before the reload ends the worker.
+async function handleReloadExtension() {
+  setTimeout(() => chrome.runtime.reload(), 300);
+  return { success: true, reloading: true, version: chrome.runtime.getManifest().version };
 }
 
 async function handleConsole(params) {
@@ -1078,6 +1159,12 @@ async function handleNetwork(params) {
 async function handleTabs(params) {
   const { action, tabId, url, frameId, title, color } = params;
   switch (action) {
+    case 'select': {
+      if (!tabId) throw new Error('tabId required');
+      const t = await chrome.tabs.get(tabId);
+      await setWorkingTab(t.id);
+      return { success: true, workingTabId: t.id, active: t.active, url: t.url, title: t.title };
+    }
     case 'list': {
       // Group details come from tabGroups.list(), which reads the current window only.
       const grouped = new Map((await tabGroups.list()).tabs.map(t => [t.id, t]));
@@ -1085,16 +1172,20 @@ async function handleTabs(params) {
       return {
         success: true,
         extensionVersion: chrome.runtime.getManifest().version,
+        workingTabId: await loadWorkingTab(),
         windows: windows.map(w => ({ id: w.id, state: w.state, focused: w.focused })),
         tabs: windows.flatMap(w => w.tabs.map(t => ({
           ...(grouped.get(t.id) || { id: t.id, url: t.url, title: t.title, active: t.active }),
           windowId: w.id,
+          working: t.id === workingTabId,
         }))),
       };
     }
     case 'create': {
-      const t = await chrome.tabs.create({ url: url || 'about:blank' });
-      return { success: true, tabId: t.id, url: t.url };
+      // Opens behind the person's tab and becomes the working tab.
+      const t = await chrome.tabs.create({ url: url || 'about:blank', active: false });
+      await setWorkingTab(t.id);
+      return { success: true, tabId: t.id, url: t.url, workingTabId: t.id };
     }
     case 'close': {
       if (!tabId) throw new Error('tabId required');
@@ -1103,7 +1194,9 @@ async function handleTabs(params) {
     }
     case 'focus': {
       if (!tabId) throw new Error('tabId required');
-      return interaction.focusTab(tabId);
+      const focused = await interaction.focusTab(tabId);
+      await setWorkingTab(tabId);
+      return { ...focused, workingTabId: tabId };
     }
     case 'frames': {
       const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab();
@@ -1209,7 +1302,6 @@ async function handleMedia(params) {
 async function handleEvaluate(params) {
   const { expression } = params;
   const tab = await getActiveTab();
-  await ensureTabFocused(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
@@ -1229,7 +1321,7 @@ async function handleClickByText(params) {
   const { text, index = 0, exact = false } = params;
   const tab = await getActiveTab();
 
-  await interaction.visibleWindow(tab);
+  await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   const point = await execInTab(tab.id, (_text, _index, _exact) => {
     const textLower = _text.toLowerCase();
@@ -1334,7 +1426,6 @@ async function handleRunAction(params) {
   const { code, actionParams = {} } = params;
   if (!code) throw new Error('code is required');
   const tab = await getActiveTab();
-  await ensureTabFocused(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
@@ -1360,7 +1451,6 @@ async function handleUploadFile(params) {
   const filePaths = fileList || (filePath ? [filePath] : []);
   if (filePaths.length === 0) throw new Error('filePath or files required');
 
-  await ensureTabFocused(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
@@ -1391,7 +1481,7 @@ async function handleDrag(params) {
   const { startRef, startSelector, endRef, endSelector, startX, startY, endX, endY, steps = 10 } = params;
   const tab = await getActiveTab();
 
-  await interaction.visibleWindow(tab);
+  await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   if (requestFrameId !== 0 && (startRef || startSelector || endRef || endSelector)) throw new Error("Use top-frame screenshot coordinates for frame dragging");
   let sx = startX, sy = startY, ex = endX, ey = endY;
@@ -1420,7 +1510,6 @@ async function handleDrag(params) {
     throw new Error('Could not determine drag coordinates. Provide refs/selectors or explicit x,y coordinates.');
   }
 
-  await ensureTabFocused(tab);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 

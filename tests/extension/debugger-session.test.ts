@@ -99,9 +99,13 @@ describe('debugger session', () => {
     expect(b).toBe('two');
     expect(events).toEqual([
       'attach:1',
+      'send:1:Emulation.setFocusEmulationEnabled',
+      'send:1:Page.setWebLifecycleState',
       'send:1:Input.dispatchMouseEvent',
       'detach:1',
       'attach:2',
+      'send:2:Emulation.setFocusEmulationEnabled',
+      'send:2:Page.setWebLifecycleState',
     ]);
     expect(session.attachedTabId()).toBe(2);
   });

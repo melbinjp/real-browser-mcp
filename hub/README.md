@@ -40,6 +40,16 @@ it from the repository:
 4. Point each CLI at the shim, as shown above, with `<repo>` replaced by the
    clone's path.
 
-To update, run `git pull`, then `npm ci` and `npm run build`. Then click Reload
-on the extension's card. Do not skip it: a restarted browser can keep running
-the old extension code even when the card shows the new version.
+To update, run `git pull`, then `npm ci` and `npm run build`. Then reload the
+extension: an agent can call `browser_reload_extension`, or click Reload on the
+extension's card. Do not skip it: a restarted browser can keep running the old
+extension code even when the card shows the new version.
+
+## Working beside the person
+
+Tools act on a working tab, not on the tab the person is looking at.
+`browser_tabs create` opens a tab in the background and makes it the working
+tab. `browser_tabs select` makes an open tab the working tab without showing
+it, so the agent can click, type and take screenshots there while the person
+keeps working in another tab or another window, or has the browser minimized.
+Nothing moves.

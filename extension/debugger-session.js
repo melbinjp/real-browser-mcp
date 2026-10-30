@@ -41,6 +41,22 @@ export function createDebuggerSession(chrome, { onDetach } = {}) {
     }
   }
 
+  /**
+   * A covered or minimized window marks its page hidden, and the browser can
+   * then hold debugger input. Ask the page to act focused and stay active.
+   * Older browsers lack these commands; input then needs a visible window.
+   */
+  async function keepPageActive(tabId) {
+    for (const [method, params] of [
+      ['Emulation.setFocusEmulationEnabled', { enabled: true }],
+      ['Page.setWebLifecycleState', { state: 'active' }],
+    ]) {
+      try {
+        await chrome.debugger.sendCommand({ tabId }, method, params);
+      } catch {}
+    }
+  }
+
   async function attachTo(tabId) {
     if (debuggerTabId === tabId) return true;
 
@@ -51,6 +67,7 @@ export function createDebuggerSession(chrome, { onDetach } = {}) {
     try {
       await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL);
       debuggerTabId = tabId;
+      await keepPageActive(tabId);
       return true;
     } catch (err) {
       const msg = String(err?.message || err);
@@ -58,6 +75,7 @@ export function createDebuggerSession(chrome, { onDetach } = {}) {
         // SW restart leaves us attached; DevTools/another extension does not.
         if (await probeOwned(tabId)) {
           debuggerTabId = tabId;
+          await keepPageActive(tabId);
           return true;
         }
         return false;
@@ -77,6 +95,14 @@ export function createDebuggerSession(chrome, { onDetach } = {}) {
   return {
     attachedTabId() {
       return debuggerTabId;
+    },
+
+    /**
+     * Detach now, outside the queue. A task that waits on a CDP call that never
+     * returns then fails, and the queue is free again.
+     */
+    async abort() {
+      if (debuggerTabId != null) await detachTab(debuggerTabId);
     },
 
     /**

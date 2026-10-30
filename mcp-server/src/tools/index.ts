@@ -8,6 +8,7 @@ import { pressKeyTool } from './press-key.js';
 import { waitTool } from './wait.js';
 import { snapshotTool } from './snapshot.js';
 import { mediaTool } from './media.js';
+import { reloadExtensionTool } from './reload-extension.js';
 import { screenshotTool } from './screenshot.js';
 import { consoleTool } from './console.js';
 import { networkTool } from './network.js';
@@ -35,6 +36,7 @@ export const allTools: ToolDefinition[] = [
   waitTool,
   snapshotTool,
   mediaTool,
+  reloadExtensionTool,
   screenshotTool,
   consoleTool,
   networkTool,
