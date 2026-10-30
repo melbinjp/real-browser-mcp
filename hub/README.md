@@ -20,3 +20,26 @@ Each CLI is pointed at the shim:
 
 Ports: `WS_PORT` (default 7225) for the extension, `HUB_PORT` (default 7226) for
 agents.
+
+## Install this fork on another device
+
+This fork is not in the Chrome Web Store or on npm, so the store extension and
+`npx real-browser-mcp` give you upstream's code without these changes. Install
+it from the repository:
+
+    git clone https://github.com/melbinjp/real-browser-mcp.git
+    cd real-browser-mcp
+    npm ci
+    npm run build
+
+1. Open `chrome://extensions` (`edge://extensions` in Edge, `brave://extensions`
+   in Brave) and turn on Developer mode.
+2. Click "Load unpacked" and select the `extension` folder of the clone.
+3. If the store version of Real Browser MCP is also installed, turn it off. Both
+   connect to port 7225, and only one can have it.
+4. Point each CLI at the shim, as shown above, with `<repo>` replaced by the
+   clone's path.
+
+To update, run `git pull`, then `npm ci` and `npm run build`. Then click Reload
+on the extension's card. Do not skip it: a restarted browser can keep running
+the old extension code even when the card shows the new version.
