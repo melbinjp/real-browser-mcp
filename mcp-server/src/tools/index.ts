@@ -1,4 +1,6 @@
+import { z } from 'zod';
 import type { ToolDefinition } from './types.js';
+import type { ExtensionBridge } from '../bridge.js';
 import { navigateTool } from './navigate.js';
 import { clickTool } from './click.js';
 import { typeTool } from './type.js';
@@ -26,7 +28,7 @@ import { dragTool } from './drag.js';
 import { fillFormTool } from './fill-form.js';
 import { webmcpListTool, webmcpExecuteTool } from './webmcp.js';
 
-export const allTools: ToolDefinition[] = [
+const baseTools: ToolDefinition[] = [
   navigateTool,
   clickTool,
   typeTool,
@@ -55,6 +57,37 @@ export const allTools: ToolDefinition[] = [
   webmcpListTool,
   webmcpExecuteTool,
 ];
+
+// Every page tool can act on one named tab for a single call, instead of the
+// agent's working tab. browser_tabs has its own tabId; the reload has no tab.
+const TAB_TARGET = {
+  tabId: z
+    .number()
+    .int()
+    .optional()
+    .describe('Act on this tab for this call only, instead of your working tab. Tab IDs come from browser_tabs list.'),
+};
+const HAS_OWN_TAB_PARAM = new Set(['browser_tabs', 'browser_reload_extension']);
+
+function withTabTarget(tool: ToolDefinition): ToolDefinition {
+  if (HAS_OWN_TAB_PARAM.has(tool.name)) return tool;
+  return {
+    ...tool,
+    inputSchema: tool.inputSchema.extend(TAB_TARGET),
+    async handler(bridge, params) {
+      const { tabId, ...rest } = params;
+      if (tabId == null) return tool.handler(bridge, rest);
+      // Some tools call a different extension tool (WebMCP calls evaluate), so
+      // the tab goes onto every call the tool makes.
+      const targeted = Object.create(bridge, {
+        callTool: { value: (name: string, p: Record<string, unknown>) => bridge.callTool(name, { ...p, tabId }) },
+      }) as ExtensionBridge;
+      return tool.handler(targeted, rest);
+    },
+  };
+}
+
+export const allTools: ToolDefinition[] = baseTools.map(withTabTarget);
 
 export const toolMap = new Map<string, ToolDefinition>(
   allTools.map(t => [t.name, t]),

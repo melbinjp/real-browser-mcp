@@ -44,6 +44,15 @@ async function ensureHub() {
   throw new Error('the browser hub did not come up');
 }
 
+// Names this agent to the extension, which keeps one working tab per agent.
+// The MCP client's name says which CLI it is, and the CLI's process ID tells
+// two sessions of the same CLI apart. RB_AGENT overrides both.
+function agentName() {
+  if (process.env.RB_AGENT) return process.env.RB_AGENT;
+  const client = server.server.getClientVersion()?.name || 'agent';
+  return `${client}#${process.ppid}`;
+}
+
 /** Same shape the tool handlers expect from ExtensionBridge. */
 const httpBridge = {
   async callTool(tool, params) {
@@ -51,7 +60,7 @@ const httpBridge = {
     const res = await fetch(`${HUB}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool, params }),
+      body: JSON.stringify({ tool, params, agent: agentName() }),
       signal: AbortSignal.timeout(120_000),
     });
     const body = await res.json();

@@ -47,9 +47,17 @@ extension code even when the card shows the new version.
 
 ## Working beside the person
 
-Tools act on a working tab, not on the tab the person is looking at.
+Each agent has its own working tab, and its tools act there, not on the tab
+the person is looking at.
 `browser_tabs create` opens a tab in the background and makes it the working
 tab. `browser_tabs select` makes an open tab the working tab without showing
 it, so the agent can click, type and take screenshots there while the person
 keeps working in another tab or another window, or has the browser minimized.
 Nothing moves.
+
+Several agents can work at once, on different tabs or on the same one. The
+shim names its agent from the MCP client and that client's process ID, for
+example `claude-code#4120`; set `RB_AGENT` to choose the name. `browser_tabs
+list` shows the caller's name and, on each tab, the agents working there. Any
+page tool takes a `tabId` to act on another tab for one call. Calls from all
+agents still run one at a time, so two agents never act in the same moment.

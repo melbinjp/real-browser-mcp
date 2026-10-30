@@ -257,7 +257,7 @@ export class ExtensionBridge {
     });
   }
 
-  async callTool(tool: string, params: Record<string, unknown>): Promise<unknown> {
+  async callTool(tool: string, params: Record<string, unknown>, agent?: string): Promise<unknown> {
     if (!this.isConnected()) {
       try {
         await this.waitForConnection(5_000);
@@ -268,10 +268,10 @@ export class ExtensionBridge {
       }
     }
 
-    return this.sendToolCall(tool, params, 0);
+    return this.sendToolCall(tool, params, 0, agent);
   }
 
-  private sendToolCall(tool: string, params: Record<string, unknown>, retryCount: number): Promise<unknown> {
+  private sendToolCall(tool: string, params: Record<string, unknown>, retryCount: number, agent?: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = String(++this.requestId);
       const timeoutMs = TOOL_TIMEOUTS[tool] || this.defaultTimeoutMs;
@@ -282,7 +282,7 @@ export class ExtensionBridge {
           reject(new Error(`Tool call timed out: ${tool}. It was not sent again, because it may still run in the browser. Check the page before you try again.`));
         } else if (retryCount < this.maxRetries) {
           console.error(`[Bridge] Timeout on ${tool}, retry ${retryCount + 1}/${this.maxRetries}`);
-          this.sendToolCall(tool, params, retryCount + 1).then(resolve, reject);
+          this.sendToolCall(tool, params, retryCount + 1, agent).then(resolve, reject);
         } else {
           reject(new Error(`Tool call timed out after ${retryCount + 1} attempts: ${tool}`));
         }
@@ -291,12 +291,13 @@ export class ExtensionBridge {
       this.pendingRequests.set(id, { resolve, reject, timeout, tool, retries: retryCount, params });
 
       try {
-        this.client!.send(JSON.stringify({ id, tool, params }));
+        // agent names the caller, so the extension can keep a working tab per agent.
+        this.client!.send(JSON.stringify({ id, tool, params, agent }));
       } catch (err) {
         clearTimeout(timeout);
         this.pendingRequests.delete(id);
         if (retryCount < this.maxRetries && this.isConnected()) {
-          this.sendToolCall(tool, params, retryCount + 1).then(resolve, reject);
+          this.sendToolCall(tool, params, retryCount + 1, agent).then(resolve, reject);
         } else {
           reject(err instanceof Error ? err : new Error('Send failed'));
         }

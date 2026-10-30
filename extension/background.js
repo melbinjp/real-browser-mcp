@@ -198,11 +198,14 @@ function broadcastStatus(message) {
 // --- Message Router ---
 
 async function handleMessage(msg) {
-  const { id, tool, params } = msg;
+  const { id, tool } = msg;
+  // Each call carries its caller, so every handler finds that agent's tab
+  // from its own params and never from state another call has changed.
+  const params = { ...(msg.params || {}), __agent: msg.agent || 'default' };
 
   let tabId = null;
   try {
-    tabId = (await getActiveTab()).id;
+    tabId = (await getActiveTab(params)).id;
   } catch {}
 
   currentActivity = tool;
@@ -211,7 +214,7 @@ async function handleMessage(msg) {
   if (tabId) await showOverlay(tabId, tool.replace('browser_', ''));
 
   try {
-    const result = await dispatch(tool, params || {});
+    const result = await dispatch(tool, params);
     sendResponse(id, { success: true, result });
   } catch (err) {
     sendResponse(id, { success: false, error: err.message || String(err) });
@@ -262,7 +265,7 @@ async function dispatch(tool, params) {
     browser_text: handleGetPageText,
   };
 
-  const tab = await getActiveTab().catch(() => null);
+  const tab = await getActiveTab(params).catch(() => null);
   requestFrameId = params.frameId ?? selectedFrames.get(tab?.id) ?? 0;
   const handler = handlers[tool];
   if (!handler) throw new Error(`Unknown tool: ${tool}`);
@@ -271,37 +274,54 @@ async function dispatch(tool, params) {
 
 // --- Helpers ---
 
-// The tab the tools act on. browser_tabs select, create and focus set it, so
-// an agent can work on one tab while the person uses another. It is kept in
+// Each agent has a working tab that its tools act on. browser_tabs select,
+// create and focus set it, so agents can work on their own tabs while the
+// person uses another. Two agents can also share one tab. The map is kept in
 // local storage because the service worker stops when idle and an extension
 // reload clears session storage; it is cleared when the browser starts,
-// because tab IDs are reused then. Without it, tools act on the active tab.
-let workingTabId;
-const WORKING_TAB_KEY = 'workingTabId';
+// because tab IDs are reused then. An agent without a working tab acts on the
+// active tab. A tabId in a call's params targets that tab for the call only.
+let workingTabs;
+const WORKING_TABS_KEY = 'workingTabs';
 
-async function loadWorkingTab() {
-  if (workingTabId === undefined) {
-    try { workingTabId = (await chrome.storage.local.get(WORKING_TAB_KEY))[WORKING_TAB_KEY] ?? null; }
-    catch { workingTabId = null; }
+async function loadWorkingTabs() {
+  if (workingTabs === undefined) {
+    try { workingTabs = (await chrome.storage.local.get(WORKING_TABS_KEY))[WORKING_TABS_KEY] ?? {}; }
+    catch { workingTabs = {}; }
   }
-  return workingTabId;
+  return workingTabs;
 }
 
-async function setWorkingTab(tabId) {
-  workingTabId = tabId;
-  try { await chrome.storage.local.set({ [WORKING_TAB_KEY]: tabId }); } catch {}
+async function saveWorkingTabs() {
+  try { await chrome.storage.local.set({ [WORKING_TABS_KEY]: workingTabs }); } catch {}
 }
 
-chrome.runtime.onStartup.addListener(() => setWorkingTab(null));
+async function setWorkingTab(agent, tabId) {
+  await loadWorkingTabs();
+  if (tabId == null) delete workingTabs[agent];
+  else workingTabs[agent] = tabId;
+  await saveWorkingTabs();
+}
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  if (await loadWorkingTab() === tabId) await setWorkingTab(null);
+chrome.runtime.onStartup.addListener(async () => {
+  workingTabs = {};
+  await saveWorkingTabs();
 });
 
-async function getActiveTab() {
-  const working = await loadWorkingTab();
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const tabs = await loadWorkingTabs();
+  const owners = Object.keys(tabs).filter(agent => tabs[agent] === tabId);
+  if (!owners.length) return;
+  for (const agent of owners) delete tabs[agent];
+  await saveWorkingTabs();
+});
+
+async function getActiveTab(params = {}) {
+  if (params.tabId != null) return chrome.tabs.get(params.tabId);
+  const agent = params.__agent || 'default';
+  const working = (await loadWorkingTabs())[agent];
   if (working != null) {
-    try { return await chrome.tabs.get(working); } catch { await setWorkingTab(null); }
+    try { return await chrome.tabs.get(working); } catch { await setWorkingTab(agent, null); }
   }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error('No active tab');
@@ -572,7 +592,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 async function handleNavigate(params) {
   const { url, waitUntil = 'load' } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return new Promise((resolve, reject) => {
     const listener = (tabId, changeInfo) => {
@@ -595,7 +615,7 @@ async function handleNavigate(params) {
 
 async function handleClick(params) {
   const { ref, selector, x: px, y: py, button = 'left', doubleClick = false } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   // Screenshot coordinates always refer to the top-level viewport.
   if (!ref && !selector && px != null && py != null) requestFrameId = 0;
 
@@ -658,7 +678,7 @@ async function handleClick(params) {
 
 async function handleType(params) {
   const { ref, selector, text, clear = false } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_ref, _sel, _text, _clear) => {
     let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
@@ -702,7 +722,7 @@ async function handleType(params) {
  */
 async function handleTypeTrusted(params) {
   const { ref, selector, text, clear = false } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
@@ -784,7 +804,7 @@ async function handleTypeTrusted(params) {
 
 async function handleScroll(params) {
   const { direction = 'down', amount = 500, selector, toElement, position } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_dir, _amt, _sel, _toEl, _pos) => {
     if (_toEl) {
@@ -825,7 +845,7 @@ async function handleScroll(params) {
 
 async function handlePressKey(params) {
   const { key, modifiers = [], ref, selector } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
   if (ref || selector) {
@@ -853,7 +873,7 @@ async function handleWait(params) {
 
   if (!selector) return { success: false, error: 'Need selector or delay' };
 
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   const start = Date.now();
 
   while (Date.now() - start < timeout) {
@@ -873,7 +893,7 @@ async function handleWait(params) {
 
 async function handleHover(params) {
   const { ref, selector } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   const loc = await locateElementCenter(tab.id, ref, selector);
   if (!loc?.found) return { success: false, error: 'Element not found' };
   return performPointerHover(tab, loc.x, loc.y);
@@ -881,7 +901,7 @@ async function handleHover(params) {
 
 async function handleSelect(params) {
   const { ref, selector, value, label, index } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_ref, _sel, _val, _lbl, _idx) => {
     let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
@@ -907,7 +927,7 @@ async function handleSelect(params) {
 
 async function handleSnapshot(params) {
   const { selector, compact = true } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_sel, _compact) => {
     let refCount = 0;
@@ -1078,7 +1098,7 @@ async function handleSnapshot(params) {
 
 async function handleScreenshot(params) {
   const { format = 'png', quality = 80 } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   const readViewport = async () => (await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[0]},func:()=>({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visibility:document.visibilityState})}))[0].result;
   const win = await chrome.windows.get(tab.windowId);
   if (!tab.active || win.state === 'minimized' || (await readViewport()).visibility !== 'visible') {
@@ -1091,7 +1111,7 @@ async function handleScreenshot(params) {
   if (viewport.visibility !== 'visible') throw new Error(`PAGE_HIDDEN: tab ${tab.id}; focus this tab before capture. No screenshot returned.`);
   const dataUrl = await bounded(chrome.tabs.captureVisibleTab(tab.windowId, {format,quality:format==='jpeg'?quality:undefined}), 4500, 'CAPTURE_TIMEOUT: Edge did not provide a fresh screenshot within 4.5 seconds.');
   await interaction.visibleWindow(tab);
-  const current = await getActiveTab();
+  const current = await getActiveTab(params);
   const after = await readViewport();
   if (current.id !== tab.id || after.visibility !== 'visible' || after.width !== viewport.width || after.height !== viewport.height) throw new Error('CAPTURE_CHANGED: tab/window/viewport changed during capture; discard and request a new screenshot.');
   return {success:true,format,data:dataUrl.split(',')[1],tabId:tab.id,windowId:tab.windowId,capturedAt:new Date().toISOString(),viewport,coordinateSpace:'CSS pixels',raster:{width:Math.round(viewport.width*viewport.dpr),height:Math.round(viewport.height*viewport.dpr)}};
@@ -1157,13 +1177,17 @@ async function handleNetwork(params) {
 }
 
 async function handleTabs(params) {
-  const { action, tabId, url, frameId, title, color } = params;
+  const { action, tabId, url, frameId, title, color, __agent: agent } = params;
   switch (action) {
     case 'select': {
       if (!tabId) throw new Error('tabId required');
       const t = await chrome.tabs.get(tabId);
-      await setWorkingTab(t.id);
-      return { success: true, workingTabId: t.id, active: t.active, url: t.url, title: t.title };
+      await setWorkingTab(agent, t.id);
+      return { success: true, agent, workingTabId: t.id, active: t.active, url: t.url, title: t.title };
+    }
+    case 'release': {
+      await setWorkingTab(agent, null);
+      return { success: true, agent, workingTabId: null };
     }
     case 'list': {
       // Group details come from tabGroups.list(), which reads the current window only.
@@ -1172,20 +1196,22 @@ async function handleTabs(params) {
       return {
         success: true,
         extensionVersion: chrome.runtime.getManifest().version,
-        workingTabId: await loadWorkingTab(),
+        agent,
+        workingTabId: (await loadWorkingTabs())[agent] ?? null,
         windows: windows.map(w => ({ id: w.id, state: w.state, focused: w.focused })),
         tabs: windows.flatMap(w => w.tabs.map(t => ({
           ...(grouped.get(t.id) || { id: t.id, url: t.url, title: t.title, active: t.active }),
           windowId: w.id,
-          working: t.id === workingTabId,
+          // The agents whose working tab this is, so agents can see each other.
+          agents: Object.keys(workingTabs).filter(a => workingTabs[a] === t.id),
         }))),
       };
     }
     case 'create': {
       // Opens behind the person's tab and becomes the working tab.
       const t = await chrome.tabs.create({ url: url || 'about:blank', active: false });
-      await setWorkingTab(t.id);
-      return { success: true, tabId: t.id, url: t.url, workingTabId: t.id };
+      await setWorkingTab(agent, t.id);
+      return { success: true, agent, tabId: t.id, url: t.url, workingTabId: t.id };
     }
     case 'close': {
       if (!tabId) throw new Error('tabId required');
@@ -1195,31 +1221,31 @@ async function handleTabs(params) {
     case 'focus': {
       if (!tabId) throw new Error('tabId required');
       const focused = await interaction.focusTab(tabId);
-      await setWorkingTab(tabId);
-      return { ...focused, workingTabId: tabId };
+      await setWorkingTab(agent, tabId);
+      return { ...focused, agent, workingTabId: tabId };
     }
     case 'frames': {
-      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab();
+      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab(params);
       const frames = await chrome.scripting.executeScript({target:{tabId:tab.id,allFrames:true},func:()=>({url:location.href,title:document.title})});
       return {success:true,tabId:tab.id,selectedFrameId:selectedFrames.get(tab.id)||0,frames:frames.map(f=>({frameId:f.frameId,documentId:f.documentId,...f.result}))};
     }
     case 'select_frame': {
-      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab();
+      const tab = tabId ? await chrome.tabs.get(tabId) : await getActiveTab(params);
       if (!Number.isInteger(frameId) || frameId < 0) throw new Error('A frameId from browser_tabs frames is required');
       await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[frameId]},func:()=>document.title});
       selectedFrames.set(tab.id,frameId); return {success:true,tabId:tab.id,frameId};
     }
     case 'name':
-      return tabGroups.name({ title, color, tabId });
+      return tabGroups.name({ title, color, tabId: tabId ?? (await getActiveTab(params)).id });
     case 'ungroup':
-      return tabGroups.ungroup({ tabId });
+      return tabGroups.ungroup({ tabId: tabId ?? (await getActiveTab(params)).id });
     default: throw new Error(`Unknown action: ${action}`);
   }
 }
 
 async function handleFind(params) {
   const { query, limit = 10 } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_q, _lim) => {
     const qLow = _q.toLowerCase();
@@ -1268,7 +1294,7 @@ async function handleFind(params) {
 
 async function handleGetPageText(params) {
   const { selector, maxLength = 50000 } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   const args = selector === undefined ? [null, maxLength] : [selector, maxLength];
 
   return execInTab(tab.id, (_sel, _max) => {
@@ -1287,7 +1313,7 @@ async function handleGetPageText(params) {
 // Read only media actually exposed in the selected document's DOM. This also
 // supports recovering generated data-URL previews when the site's export hangs.
 async function handleMedia(params) {
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   return execInTab(tab.id, (includeData) => ({
     success: true,
     media: Array.from(document.querySelectorAll('video,audio,img')).map(el => {
@@ -1301,7 +1327,7 @@ async function handleMedia(params) {
 
 async function handleEvaluate(params) {
   const { expression } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
@@ -1319,7 +1345,7 @@ async function handleEvaluate(params) {
 
 async function handleClickByText(params) {
   const { text, index = 0, exact = false } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
@@ -1368,7 +1394,7 @@ async function handleClickByText(params) {
 
 async function handleDialog(params) {
   const { action = 'accept', promptText } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_action, _promptText) => {
     window.__mcpDialogLog = window.__mcpDialogLog || [];
@@ -1425,7 +1451,7 @@ async function handleRunAction(params) {
   if (requestFrameId !== 0) throw new Error('run_action is top-frame only. Use frame snapshot/type/keys, or select_frame 0.');
   const { code, actionParams = {} } = params;
   if (!code) throw new Error('code is required');
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
     if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
@@ -1447,7 +1473,7 @@ async function handleRunAction(params) {
 
 async function handleUploadFile(params) {
   const { ref, selector, filePath, files: fileList } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
   const filePaths = fileList || (filePath ? [filePath] : []);
   if (filePaths.length === 0) throw new Error('filePath or files required');
 
@@ -1479,7 +1505,7 @@ async function handleUploadFile(params) {
 
 async function handleDrag(params) {
   const { startRef, startSelector, endRef, endSelector, startX, startY, endX, endY, steps = 10 } = params;
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   await interaction.inputReady(tab);
   await interaction.ensureDebugger(tab.id);
@@ -1539,7 +1565,7 @@ async function handleFillForm(params) {
   if (!fields || !Array.isArray(fields) || fields.length === 0) {
     throw new Error('fields array is required');
   }
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(params);
 
   return execInTab(tab.id, (_fields, _submit) => {
     const results = [];

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { allTools, toolMap } from '../../mcp-server/src/tools/index.js';
 
 describe('Tool Registry', () => {
@@ -44,3 +44,26 @@ describe('Tool Registry', () => {
     });
   }
 });
+
+describe('one-call tab target', () => {
+  it('lets every page tool name a tab, but not browser_tabs or the reload', () => {
+    for (const tool of allTools) {
+      const has = 'tabId' in tool.inputSchema.shape;
+      if (tool.name === 'browser_reload_extension') expect(has).toBe(false);
+      else expect(has).toBe(true);
+    }
+    expect(toolMap.get('browser_click')!.inputSchema.safeParse({ ref: 'e1' }).success).toBe(true);
+  });
+
+  it('puts the tab on every call the tool makes, and nothing when no tab is named', async () => {
+    const callTool = vi.fn(async () => ({ success: true, result: { tools: [] } }));
+    const bridge = { callTool } as any;
+    await toolMap.get('browser_webmcp_list_tools')!.handler(bridge, { tabId: 77 });
+    expect(callTool.mock.calls[0][0]).toBe('browser_evaluate');
+    expect(callTool.mock.calls[0][1]).toMatchObject({ tabId: 77 });
+    callTool.mockClear();
+    await toolMap.get('browser_snapshot')!.handler(bridge, { compact: true });
+    expect(callTool.mock.calls[0][1]).not.toHaveProperty('tabId');
+  });
+});
+

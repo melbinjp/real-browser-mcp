@@ -41,15 +41,15 @@ const server = http.createServer((req, res) => {
       if (body.length > 20e6) req.destroy();
     });
     req.on('end', async () => {
-      let tool, params;
+      let tool, params, agent;
       try {
-        ({ tool, params } = JSON.parse(body));
+        ({ tool, params, agent } = JSON.parse(body));
       } catch {
         return send(res, 400, { success: false, error: 'Body is not valid JSON' });
       }
       if (!tool) return send(res, 400, { success: false, error: 'No tool named' });
       try {
-        const result = await bridge.callTool(tool, params || {});
+        const result = await bridge.callTool(tool, params || {}, agent);
         send(res, 200, { success: true, result });
       } catch (err) {
         send(res, 200, { success: false, error: err?.message || String(err) });

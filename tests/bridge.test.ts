@@ -66,6 +66,27 @@ describe('ExtensionBridge', () => {
     expect(result).toEqual({ clicked: true });
   });
 
+  it('names the calling agent in the message, so the extension can keep its tab', async () => {
+    const port = nextPort();
+    const bridge = createBridge(port);
+    await bridge.start();
+
+    const client = await connectClient(port);
+    const seen: Array<{ agent?: string }> = [];
+    client.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.tool) {
+        seen.push(msg);
+        client.send(JSON.stringify({ id: msg.id, success: true, result: {} }));
+      }
+    });
+
+    await bridge.callTool('browser_snapshot', {}, 'claude-code#41');
+    await bridge.callTool('browser_snapshot', {});
+    expect(seen[0].agent).toBe('claude-code#41');
+    expect(seen[1].agent).toBeUndefined();
+  });
+
   it('rejects on error response', async () => {
     const port = nextPort();
     const bridge = createBridge(port);
