@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 // The production extension module is deliberately dependency-free.
 // @ts-ignore JavaScript extension module
 import { createInteraction, keyEvent, bounded } from '../extension/interaction.js';
+// @ts-ignore JavaScript extension module
+import { createDebuggerSession } from '../extension/debugger-session.js';
 
 function browser(state = 'normal') {
   let listener: (source: any) => void = () => {};
@@ -21,21 +23,23 @@ function browser(state = 'normal') {
   return { api, win, detach: (id: number) => listener({ tabId: id }) };
 }
 
+const interactionFor = (api: any) => createInteraction(api, createDebuggerSession(api));
+
 describe('browser interaction reliability', () => {
   it('explicit focus restores a minimized window before focusing it', async () => {
     const { api } = browser('minimized');
-    const result = await createInteraction(api).focusTab(12);
+    const result = await interactionFor(api).focusTab(12);
     expect(api.windows.update.mock.calls).toEqual([[8, { state: 'normal' }], [8, { focused: true }]]);
     expect(result).toMatchObject({ focused: 12, windowState: 'normal', windowFocused: true });
   });
   it('preserves maximized state on focus', async () => {
     const { api } = browser('maximized');
-    await createInteraction(api).focusTab(12);
+    await interactionFor(api).focusTab(12);
     expect(api.windows.update.mock.calls).toEqual([[8, { focused: true }]]);
   });
   it('rejects minimized captures/inputs without restoring or dispatching', async () => {
     const { api } = browser('minimized');
-    await expect(createInteraction(api).visibleWindow({ id: 12, windowId: 8 })).rejects.toThrow('WINDOW_MINIMIZED');
+    await expect(interactionFor(api).visibleWindow({ id: 12, windowId: 8 })).rejects.toThrow('WINDOW_MINIMIZED');
     expect(api.windows.update).not.toHaveBeenCalled();
     expect(api.debugger.sendCommand).not.toHaveBeenCalled();
   });
@@ -43,7 +47,7 @@ describe('browser interaction reliability', () => {
     vi.useFakeTimers();
     try {
       const { api, detach } = browser();
-      const i = createInteraction(api);
+      const i = interactionFor(api);
       let ready = i.ensureDebugger(12); await vi.runAllTimersAsync(); await ready;
       await i.ensureDebugger(12);
       expect(api.debugger.attach).toHaveBeenCalledTimes(1);
@@ -54,12 +58,11 @@ describe('browser interaction reliability', () => {
       expect(api.debugger.attach).toHaveBeenCalledTimes(3);
     } finally { vi.useRealTimers(); }
   });
-  it('sends one trusted press/release pair for one click', async () => {
+  it('reports a debugger it cannot attach instead of continuing', async () => {
     const { api } = browser();
-    await createInteraction(api).mouseClick(12, 90, 70);
-    expect(api.debugger.sendCommand.mock.calls.map(c => c[2].type)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased']);
-    expect(api.debugger.sendCommand.mock.calls[1][2]).toMatchObject({ buttons: 1, clickCount: 1 });
-    expect(api.debugger.sendCommand.mock.calls[2][2]).toMatchObject({ buttons: 0, clickCount: 1 });
+    api.debugger.attach.mockRejectedValueOnce(new Error('Another debugger is already attached'));
+    api.debugger.sendCommand.mockRejectedValueOnce(new Error('not owned'));
+    await expect(interactionFor(api).ensureDebugger(12)).rejects.toThrow('DEBUGGER_BUSY');
   });
   it('maps native editing and navigation keys and rejects unknown keys', () => {
     expect(keyEvent('Ctrl+A')).toMatchObject({ key: 'A', code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 });

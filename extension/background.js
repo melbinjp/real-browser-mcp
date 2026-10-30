@@ -1,5 +1,6 @@
 import { createInteraction, keyEvent, bounded } from './interaction.js';
-const interaction = createInteraction(chrome);
+import { createTabGroups } from './tab-groups.js';
+import { createDebuggerSession } from './debugger-session.js';
 let commandQueue = Promise.resolve();
 const selectedFrames = new Map();
 let requestFrameId = 0;
@@ -23,6 +24,13 @@ let networkRequests = [];
 let currentActivity = null;
 let activeTabId = null;
 let pendingDialog = null;
+const tabGroups = createTabGroups(chrome);
+/** Last visual/CDP pointer position per tab, used to animate movement. */
+const lastPointer = new Map();
+const POINTER_STEPS = 8;
+const POINTER_STEP_MS = 24;
+const DEBUGGER_ATTACH_ERROR =
+  'Could not attach debugger. Close DevTools on this tab or accept the debug infobar.';
 
 // --- Connection Management ---
 
@@ -33,6 +41,7 @@ async function initConnection() {
   } catch {}
 
   chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_INTERVAL_MIN });
+  tabGroups.ensureLoaded().catch(() => {});
   connect();
 }
 
@@ -261,6 +270,268 @@ async function execInTab(tabId, func, args = []) {
   return results[0]?.result;
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function mouseButtonName(button) {
+  if (button === 'right') return 'right';
+  if (button === 'middle') return 'middle';
+  return 'left';
+}
+
+function mouseButtonsMask(button, down) {
+  if (!down) return 0;
+  if (button === 'right') return 2;
+  if (button === 'middle') return 4;
+  return 1;
+}
+
+/** Bring the target tab to the front so the debug infobar and pointer are visible. */
+async function ensureTabFocused(tab) {
+  if (!tab?.id) return;
+  if (!tab.active) {
+    await chrome.tabs.update(tab.id, { active: true });
+  }
+}
+
+async function sendMouse(tabId, type, x, y, extras = {}) {
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type,
+    x: Math.round(x),
+    y: Math.round(y),
+    ...extras,
+  });
+}
+
+/** Inject a blue-glow cursor + optional click ripple. Survives until detach or navigation. */
+async function showVisualCursor(tabId, x, y, click) {
+  try {
+    await execInTab(tabId, (_x, _y, _click) => {
+      const HOST_ID = '__rbmcp-cursor-host';
+      let host = document.getElementById(HOST_ID);
+      if (!host) {
+        host = document.createElement('div');
+        host.id = HOST_ID;
+        host.setAttribute('aria-hidden', 'true');
+        host.style.cssText = 'all:initial;position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
+        const shadow = host.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+          <style>
+            .glow {
+              position: fixed;
+              width: 48px;
+              height: 48px;
+              margin: -24px 0 0 -24px;
+              border-radius: 50%;
+              background: radial-gradient(circle, rgba(59,130,246,0.50) 0%, rgba(59,130,246,0.22) 45%, rgba(59,130,246,0) 72%);
+              pointer-events: none;
+              will-change: left, top;
+              transition: left 180ms ease-out, top 180ms ease-out;
+            }
+            .arrow {
+              position: fixed;
+              width: 18px;
+              height: 18px;
+              margin: -1px 0 0 -1px;
+              pointer-events: none;
+              will-change: left, top;
+              transition: left 180ms ease-out, top 180ms ease-out;
+              filter: drop-shadow(0 1px 1px rgba(0,0,0,.35));
+            }
+            .ripple {
+              position: fixed;
+              width: 16px;
+              height: 16px;
+              margin: -8px 0 0 -8px;
+              border-radius: 50%;
+              border: 2px solid rgba(37,99,235,0.9);
+              background: rgba(59,130,246,0.25);
+              pointer-events: none;
+              animation: rbmcp-rip 450ms ease-out forwards;
+            }
+            @keyframes rbmcp-rip {
+              from { transform: scale(0.6); opacity: 1; }
+              to { transform: scale(3.2); opacity: 0; }
+            }
+          </style>
+          <div class="glow"></div>
+          <svg class="arrow" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+            <path d="M2 1.5 L2 15.5 L6.2 11.8 L9.4 17.2 L12.2 15.9 L9 10.4 L14.8 10.4 Z" fill="#111827" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/>
+          </svg>
+        `;
+        (document.documentElement || document.body).appendChild(host);
+      }
+
+      const shadow = host.shadowRoot;
+      const glow = shadow.querySelector('.glow');
+      const arrow = shadow.querySelector('.arrow');
+      const first = host.dataset.ready !== '1';
+      if (first) {
+        glow.style.transition = 'none';
+        arrow.style.transition = 'none';
+      }
+      glow.style.left = _x + 'px';
+      glow.style.top = _y + 'px';
+      arrow.style.left = _x + 'px';
+      arrow.style.top = _y + 'px';
+      if (first) {
+        host.dataset.ready = '1';
+        void glow.offsetWidth;
+        glow.style.transition = '';
+        arrow.style.transition = '';
+      }
+      if (_click) {
+        const ripple = document.createElement('div');
+        ripple.className = 'ripple';
+        ripple.style.left = _x + 'px';
+        ripple.style.top = _y + 'px';
+        shadow.appendChild(ripple);
+        ripple.addEventListener('animationend', () => ripple.remove());
+      }
+    }, [x, y, click]);
+  } catch {}
+}
+
+async function hideVisualCursor(tabId) {
+  try {
+    await execInTab(tabId, () => document.getElementById('__rbmcp-cursor-host')?.remove());
+  } catch {}
+}
+
+async function movePointer(tabId, x, y, { attached, click = false } = {}) {
+  const prev = lastPointer.get(tabId);
+  const from = prev || { x: x - 48, y: y - 36 };
+  await showVisualCursor(tabId, from.x, from.y, false);
+  await showVisualCursor(tabId, x, y, false);
+
+  if (attached) {
+    for (let i = 1; i <= POINTER_STEPS; i++) {
+      const t = i / POINTER_STEPS;
+      await sendMouse(
+        tabId,
+        'mouseMoved',
+        from.x + (x - from.x) * t,
+        from.y + (y - from.y) * t,
+        { button: 'none' },
+      );
+      await sleep(POINTER_STEP_MS);
+    }
+  } else {
+    await sleep(180);
+  }
+
+  lastPointer.set(tabId, { x, y });
+  if (click) await showVisualCursor(tabId, x, y, true);
+}
+
+async function locateElementCenter(tabId, ref, selector) {
+  return execInTab(tabId, (_ref, _sel) => {
+    let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
+    if (!el && _sel) el = document.querySelector(_sel);
+    if (!el) return { found: false };
+    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+    const rect = el.getBoundingClientRect();
+    if (el.focus) el.focus();
+    return {
+      found: true,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+  }, [ref, selector]);
+}
+
+async function syntheticClickAt(tabId, x, y, button, doubleClick) {
+  return execInTab(tabId, (_x, _y, _btn, _dbl) => {
+    const el = document.elementFromPoint(_x, _y);
+    if (!el) return { success: false, error: 'Element not found' };
+    const btnVal = _btn === 'left' ? 0 : _btn === 'right' ? 2 : 1;
+    const init = { bubbles: true, cancelable: true, view: window, clientX: _x, clientY: _y, button: btnVal };
+    el.dispatchEvent(new MouseEvent('mouseover', init));
+    el.dispatchEvent(new MouseEvent('mousedown', init));
+    if (el.focus) el.focus();
+    el.dispatchEvent(new MouseEvent('mouseup', init));
+    el.dispatchEvent(new MouseEvent('click', init));
+    if (_dbl) {
+      el.dispatchEvent(new MouseEvent('mousedown', init));
+      el.dispatchEvent(new MouseEvent('mouseup', init));
+      el.dispatchEvent(new MouseEvent('click', init));
+      el.dispatchEvent(new MouseEvent('dblclick', init));
+    }
+    return { success: true };
+  }, [x, y, button, doubleClick]);
+}
+
+const debuggerSession = createDebuggerSession(chrome, {
+  onDetach(tabId) {
+    lastPointer.delete(tabId);
+    hideVisualCursor(tabId);
+  },
+});
+const interaction = createInteraction(chrome, debuggerSession);
+
+async function performPointerClick(tab, x, y, { button = 'left', doubleClick = false } = {}) {
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    await movePointer(tab.id, x, y, { attached, click: true });
+
+    if (attached) {
+      const btn = mouseButtonName(button);
+      await sendMouse(tab.id, 'mousePressed', x, y, {
+        button: btn,
+        clickCount: 1,
+        buttons: mouseButtonsMask(button, true),
+      });
+      await sleep(40);
+      await sendMouse(tab.id, 'mouseReleased', x, y, {
+        button: btn,
+        clickCount: 1,
+        buttons: 0,
+      });
+      if (doubleClick) {
+        await sendMouse(tab.id, 'mousePressed', x, y, {
+          button: btn,
+          clickCount: 2,
+          buttons: mouseButtonsMask(button, true),
+        });
+        await sleep(40);
+        await sendMouse(tab.id, 'mouseReleased', x, y, {
+          button: btn,
+          clickCount: 2,
+          buttons: 0,
+        });
+      }
+      return { success: true };
+    }
+
+    return syntheticClickAt(tab.id, x, y, button, doubleClick);
+  });
+}
+
+async function performPointerHover(tab, x, y) {
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    await movePointer(tab.id, x, y, { attached, click: false });
+    if (!attached) {
+      await execInTab(tab.id, (_x, _y) => {
+        const el = document.elementFromPoint(_x, _y);
+        if (!el) return;
+        const init = { bubbles: true, cancelable: true, view: window, clientX: _x, clientY: _y };
+        el.dispatchEvent(new MouseEvent('mouseenter', { ...init, bubbles: false }));
+        el.dispatchEvent(new MouseEvent('mouseover', init));
+        el.dispatchEvent(new MouseEvent('mousemove', init));
+      }, [x, y]);
+    }
+    return { success: true };
+  });
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (tabId !== debuggerSession.attachedTabId() || changeInfo.status !== 'complete') return;
+  const pos = lastPointer.get(tabId);
+  if (pos) showVisualCursor(tabId, pos.x, pos.y, false);
+});
+
 // --- Tool Handlers ---
 
 async function handleNavigate(params) {
@@ -346,7 +617,7 @@ async function handleClick(params) {
   }, [ref, selector, px, py, button, doubleClick]);
   if (!point?.success) return point;
   if (requestFrameId !== 0) throw new Error('FRAME_COORDINATES: use top-level screenshot coordinates for trusted clicks; frame selectors are supported by snapshot, type, keys and scroll.');
-  return interaction.mouseClick(tab.id, point.x, point.y, button, doubleClick);
+  return performPointerClick(tab, point.x, point.y, { button, doubleClick });
 }
 
 async function handleType(params) {
@@ -567,24 +838,9 @@ async function handleWait(params) {
 async function handleHover(params) {
   const { ref, selector } = params;
   const tab = await getActiveTab();
-
-  return execInTab(tab.id, (_ref, _sel) => {
-    let el = _ref ? document.querySelector(`[data-mcp-ref="${_ref}"]`) : null;
-    if (!el && _sel) el = document.querySelector(_sel);
-    if (!el) return { success: false, error: 'Element not found' };
-
-    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    const init = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-
-    el.dispatchEvent(new MouseEvent('mouseenter', { ...init, bubbles: false }));
-    el.dispatchEvent(new MouseEvent('mouseover', init));
-    el.dispatchEvent(new MouseEvent('mousemove', init));
-
-    return { success: true };
-  }, [ref, selector]);
+  const loc = await locateElementCenter(tab.id, ref, selector);
+  if (!loc?.found) return { success: false, error: 'Element not found' };
+  return performPointerHover(tab, loc.x, loc.y);
 }
 
 async function handleSelect(params) {
@@ -820,12 +1076,21 @@ async function handleNetwork(params) {
 }
 
 async function handleTabs(params) {
-  const { action, tabId, url, frameId } = params;
+  const { action, tabId, url, frameId, title, color } = params;
   switch (action) {
     case 'list': {
-      const tabs = await chrome.tabs.query({});
-      const windows = await chrome.windows.getAll();
-      return { success: true, extensionVersion:chrome.runtime.getManifest().version, windows:windows.map(w=>({id:w.id,state:w.state,focused:w.focused})), tabs: tabs.map(t => ({ id: t.id,windowId:t.windowId,url: t.url,title: t.title,active: t.active })) };
+      // Group details come from tabGroups.list(), which reads the current window only.
+      const grouped = new Map((await tabGroups.list()).tabs.map(t => [t.id, t]));
+      const windows = await chrome.windows.getAll({ populate: true });
+      return {
+        success: true,
+        extensionVersion: chrome.runtime.getManifest().version,
+        windows: windows.map(w => ({ id: w.id, state: w.state, focused: w.focused })),
+        tabs: windows.flatMap(w => w.tabs.map(t => ({
+          ...(grouped.get(t.id) || { id: t.id, url: t.url, title: t.title, active: t.active }),
+          windowId: w.id,
+        }))),
+      };
     }
     case 'create': {
       const t = await chrome.tabs.create({ url: url || 'about:blank' });
@@ -851,6 +1116,10 @@ async function handleTabs(params) {
       await chrome.scripting.executeScript({target:{tabId:tab.id,frameIds:[frameId]},func:()=>document.title});
       selectedFrames.set(tab.id,frameId); return {success:true,tabId:tab.id,frameId};
     }
+    case 'name':
+      return tabGroups.name({ title, color, tabId });
+    case 'ungroup':
+      return tabGroups.ungroup({ tabId });
     default: throw new Error(`Unknown action: ${action}`);
   }
 }
@@ -940,9 +1209,10 @@ async function handleMedia(params) {
 async function handleEvaluate(params) {
   const { expression } = params;
   const tab = await getActiveTab();
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
-  await interaction.ensureDebugger(tab.id);
-  try {
     const { result, exceptionDetails } = await chrome.debugger.sendCommand(
       { tabId: tab.id },
       'Runtime.evaluate',
@@ -952,9 +1222,7 @@ async function handleEvaluate(params) {
       return { success: false, error: exceptionDetails.exception?.description || exceptionDetails.text };
     }
     return { success: true, result: result.value };
-  } finally {
-    // Debugger retained until another tab is selected or the user cancels it.
-  }
+  });
 }
 
 async function handleClickByText(params) {
@@ -1001,7 +1269,9 @@ async function handleClickByText(params) {
   }, [text, index, exact]);
   if (!point?.success) return point;
   if (requestFrameId !== 0) throw new Error('Use top-level screenshot coordinates for frame clicks.');
-  return {...await interaction.mouseClick(tab.id,point.x,point.y),clicked:point.clicked,matchCount:point.matchCount};
+  const clicked = await performPointerClick(tab, point.x, point.y, { button: 'left' });
+  if (!clicked?.success) return clicked;
+  return { success: true, clicked: point.clicked, matchCount: point.matchCount };
 }
 
 async function handleDialog(params) {
@@ -1064,9 +1334,10 @@ async function handleRunAction(params) {
   const { code, actionParams = {} } = params;
   if (!code) throw new Error('code is required');
   const tab = await getActiveTab();
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
 
-  await interaction.ensureDebugger(tab.id);
-  try {
     const paramsJson = JSON.stringify(actionParams);
     const expression = `(async function() { try { var tool = (${code}); if (tool && typeof tool.execute === "function") { return await tool.execute(${paramsJson}); } return { error: "No execute function found" }; } catch(e) { return { error: e.message, stack: e.stack }; } })()`;
 
@@ -1080,9 +1351,7 @@ async function handleRunAction(params) {
       return { success: false, error: exceptionDetails.exception?.description || exceptionDetails.text };
     }
     return { success: true, result: result.value };
-  } finally {
-    // Debugger retained until another tab is selected or the user cancels it.
-  }
+  });
 }
 
 async function handleUploadFile(params) {
@@ -1091,8 +1360,10 @@ async function handleUploadFile(params) {
   const filePaths = fileList || (filePath ? [filePath] : []);
   if (filePaths.length === 0) throw new Error('filePath or files required');
 
-  await interaction.ensureDebugger(tab.id);
-  try {
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
+
     await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.enable', {});
     const { root } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.getDocument', {});
 
@@ -1113,9 +1384,7 @@ async function handleUploadFile(params) {
     });
 
     return { success: true, files: filePaths, selector: sel };
-  } finally {
-    // Debugger retained until another tab is selected or the user cancels it.
-  }
+  });
 }
 
 async function handleDrag(params) {
@@ -1151,30 +1420,29 @@ async function handleDrag(params) {
     throw new Error('Could not determine drag coordinates. Provide refs/selectors or explicit x,y coordinates.');
   }
 
-  await interaction.ensureDebugger(tab.id);
-  try {
-    await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: sx, y: sy, button: 'left', clickCount: 1,
-    });
+  await ensureTabFocused(tab);
+  return debuggerSession.withDebugger(tab.id, async ({ attached }) => {
+    if (!attached) throw new Error(DEBUGGER_ATTACH_ERROR);
+
+    await showVisualCursor(tab.id, sx, sy, false);
+    await sendMouse(tab.id, 'mousePressed', sx, sy, { button: 'left', clickCount: 1, buttons: 1 });
 
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
-      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchMouseEvent', {
-        type: 'mouseMoved',
-        x: Math.round(sx + (ex - sx) * t),
-        y: Math.round(sy + (ey - sy) * t),
-        button: 'left', buttons: 1,
-      });
+      const nx = sx + (ex - sx) * t;
+      const ny = sy + (ey - sy) * t;
+      await sendMouse(tab.id, 'mouseMoved', nx, ny, { button: 'left', buttons: 1 });
+      if (i === 1 || i === steps || i % 2 === 0) {
+        await showVisualCursor(tab.id, nx, ny, false);
+      }
     }
 
-    await chrome.debugger.sendCommand({ tabId: tab.id }, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: ex, y: ey, button: 'left', clickCount: 1,
-    });
+    await sendMouse(tab.id, 'mouseReleased', ex, ey, { button: 'left', clickCount: 1, buttons: 0 });
+    await showVisualCursor(tab.id, ex, ey, true);
+    lastPointer.set(tab.id, { x: ex, y: ey });
 
     return { success: true, from: { x: sx, y: sy }, to: { x: ex, y: ey } };
-  } finally {
-    // Debugger retained until another tab is selected or the user cancels it.
-  }
+  });
 }
 
 async function handleFillForm(params) {

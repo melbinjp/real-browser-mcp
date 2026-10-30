@@ -1,23 +1,18 @@
 // Keep the debugger attached during a tab's working session. Repeated attach /
 // detach toggles Edge's infobar and invalidates screenshot coordinates.
-export function createInteraction(chromeApi) {
-  let attachedTab = null;
-  chromeApi.debugger.onDetach.addListener(source => {
-    if (source.tabId === attachedTab) attachedTab = null;
-  });
+// The session from debugger-session.js owns the attachment; this only waits
+// for the viewport to settle after a new attach. Do not call ensureDebugger
+// from inside session.withDebugger: the session queue would wait on itself.
+export function createInteraction(chromeApi, session) {
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   async function ensureDebugger(tabId) {
-    if (attachedTab === tabId) return;
-    if (attachedTab !== null) {
-      const previous = attachedTab;
-      attachedTab = null;
-      try { await chromeApi.debugger.detach({ tabId: previous }); } catch {}
-    }
-    await chromeApi.debugger.attach({ tabId }, '1.3');
-    attachedTab = tabId;
+    const wasAttached = session.attachedTabId() === tabId;
+    await session.withDebugger(tabId, ({ attached }) => {
+      if (!attached) throw new Error('DEBUGGER_BUSY: could not attach the debugger. Close DevTools on this tab or accept the debug infobar.');
+    });
     // Let the infobar's viewport resize settle before resolving coordinates.
-    await delay(180);
+    if (!wasAttached) await delay(180);
   }
 
   async function visibleWindow(tab) {
@@ -39,18 +34,7 @@ export function createInteraction(chromeApi) {
     return { success: true, focused: tabId, windowId: actual.id, windowState: actual.state, windowFocused: actual.focused };
   }
 
-  async function mouseClick(tabId, x, y, button = 'left', doubleClick = false) {
-    const buttons = { left: 1, right: 2, middle: 4 };
-    const send = params => chromeApi.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', params);
-    await send({ type: 'mouseMoved', x, y });
-    for (let count = 1; count <= (doubleClick ? 2 : 1); count++) {
-      await send({ type: 'mousePressed', x, y, button, buttons: buttons[button], clickCount: count });
-      await send({ type: 'mouseReleased', x, y, button, buttons: 0, clickCount: count });
-    }
-    return { success: true, trusted: true, dispatched: true, x, y, button, doubleClick };
-  }
-
-  return { ensureDebugger, visibleWindow, focusTab, mouseClick };
+  return { ensureDebugger, visibleWindow, focusTab };
 }
 
 export function keyEvent(key, modifiers = []) {

@@ -23,6 +23,7 @@ import { uploadFileTool } from './upload-file.js';
 import { runActionTool } from './run-action.js';
 import { dragTool } from './drag.js';
 import { fillFormTool } from './fill-form.js';
+import { webmcpListTool, webmcpExecuteTool } from './webmcp.js';
 
 export const allTools: ToolDefinition[] = [
   navigateTool,
@@ -49,6 +50,8 @@ export const allTools: ToolDefinition[] = [
   runActionTool,
   dragTool,
   fillFormTool,
+  webmcpListTool,
+  webmcpExecuteTool,
 ];
 
 export const toolMap = new Map<string, ToolDefinition>(
